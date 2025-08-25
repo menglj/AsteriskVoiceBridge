@@ -1,0 +1,105 @@
+{
+    "commands": [
+        {
+            "command": "engage_ai"
+        },
+        {
+            "command": "disengage_ai",
+            "wait": 60
+        },
+        {
+            "command": "play_file",
+            "wait": 61,
+            "parameters": {
+                "file": "ttscache_pleasehaveaniceday",
+                "language": "en"
+            }
+        },
+        {
+            "command": "hang_up_call",
+            "wait": 64
+        }
+    ],
+    "instructions": "You are a virtual assistant for the Sangoma Corporation's phone system. Your role is to accurately determine the intent of each caller and direct them appropriately. Follow these instructions carefully. Support: If the caller indicates they are looking for support, find out what kind of product they require support on. Once collected, use the function support_queue. Sales: If the caller is looking to speak with someone in sales, find out if they are an existing or new customer then use the sales_queue function. Accounts: If the caller indicates they are having an issue with their account, use the function account_queue.  When responding, be polite and clear, and ensure you always confirm the caller's intent before proceeding with any action.  If the user indicates the confirmed choice is wrong, start the conversation over.  Keep responses short.  Always start the conversation by saying:Thank you for calling Sangoma. Please tell me how we can help you today?",
+    "tools": [
+        {
+            "dtmf_equivalent": "3",
+            "url": "http://localhost:8989/ivr-deadend.json",
+            "tool": {
+                "type": "function",
+                "name": "dead_end",
+                "description": "The destination when the user's intent can not be determined.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        },
+        {
+            "dtmf_equivalent": "0",
+            "url": "http://localhost:8989/ivr-support.json",
+            "tool": {
+                "type": "function",
+                "name": "support_queue",
+                "description": "The destination for callers seeking support",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "product": {
+                            "type": "string",
+                            "description": "The product the customer is looking for support on.",
+                            "enum": [
+                                "PBX",
+                                "Phones",
+                                "Cloud",
+                                "Gateway",
+                                "Hardware"
+                            ]
+                        }
+                    },
+                    "required": [
+                        "product"
+                    ]
+                }
+            }
+        },
+        {
+            "dtmf_equivalent": "1",
+            "url": "http://localhost:8989/ivr-sales.json",
+            "tool": {
+                "type": "function",
+                "name": "sales_queue",
+                "description": "The destination for callers looking for sales.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "description": "If the caller is a new or existing customer",
+                            "enum": [
+                                "New",
+                                "Existing"
+                            ]
+                        }
+                    },
+                    "required": [
+                        "status"
+                    ]
+                }
+            }
+        },
+        {
+            "dtmf_equivalent": "2",
+            "url": "http://localhost:8989/ivr-accounts.json",
+            "tool": {
+                "type": "function",
+                "name": "account_queue",
+                "description": "The destination for callers requiring help with their account.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }
+    ]
+}

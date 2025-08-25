@@ -1,0 +1,7 @@
+{
+    "commands": [
+        {"command": "disengage_ai"},
+        {"command": "dial_plan", "parameters": {"host":"vais-ivr-demo", "userinfo":"6122"}},
+        {"command": "hang_up_call", "wait": 7}
+    ]
+}
