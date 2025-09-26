@@ -22,8 +22,8 @@ import (
 
 	"github.com/asterisk/AsteriskVoiceBridge/ariman"
 	"github.com/asterisk/AsteriskVoiceBridge/deepgram"
+	"github.com/asterisk/AsteriskVoiceBridge/google"
 	"github.com/asterisk/AsteriskVoiceBridge/rclocal"
-	"github.com/asterisk/AsteriskVoiceBridge/voiceai"
 	"github.com/asterisk/AsteriskVoiceBridge/vproxy"
 )
 
@@ -281,22 +281,32 @@ type commandFilePlayParams struct {
 
 func CommandEngageAI(v *VoiceBot, callid string, parameters string) bool {
 	log.Info("BOT:CommandEngageAI", "callid", callid, "parameters", parameters)
-	if v.chatController != nil {
-		v.chatController.Engage(callid)
-	}
-	if v.ttsprovider != nil {
-		v.ttsprovider.Engage(callid)
+	// Translation is always engaged when STT is active
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		if v.googleTTSProvider != nil {
+			v.googleTTSProvider.Engage(callid)
+		}
+	} else {
+		if v.ttsprovider != nil {
+			v.ttsprovider.Engage(callid)
+		}
 	}
 	return true
 }
 
 func CommandDisengageAI(v *VoiceBot, callid string, parameters string) bool {
 	log.Info("BOT:CommandDisengageAI", "callid", callid, "parameters", parameters)
-	if v.chatController != nil {
-		v.chatController.Disengage(callid)
-	}
-	if v.ttsprovider != nil {
-		v.ttsprovider.Disengage(callid)
+	// Translation is always engaged when STT is active
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		if v.googleTTSProvider != nil {
+			v.googleTTSProvider.Disengage(callid)
+		}
+	} else {
+		if v.ttsprovider != nil {
+			v.ttsprovider.Disengage(callid)
+		}
 	}
 	v.CancelText(callid)
 	return true
@@ -362,11 +372,16 @@ type VoiceBot struct {
 
 	ariController *ariman.Connector
 
+	// Deepgram providers (original)
 	ttsprovider *deepgram.TTSDeepgram
 	sttprovider *deepgram.DeepgramSTTProvider
 
-	remoteCommander *rclocal.StudioCommander                 //RC
-	chatController  *voiceai.OPENAIWebsocketDialogController // CC
+	// Google providers (new)
+	googleTTSProvider *google.TTSGoogle
+	googleSTTProvider *google.GoogleSTTProvider
+
+	remoteCommander   *rclocal.StudioCommander     //RC
+	translateProvider *google.GoogleTranslateProvider // Translation provider
 }
 
 func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage string) (*VoiceBot, bool) {
@@ -379,7 +394,7 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 	http_url := "http://" + ariman.AST_ADD + ":8088/ari"
 	ws_url := "ws://" + ariman.AST_ADD + ":8088/ari/events"
 
-	aricontroller, ok := ariman.CreateConnector("voicebot", "quagmire", "alphabetsoup", http_url, ws_url)
+	aricontroller, ok := ariman.CreateConnector("voicebot", "asterisk", "asterisk", http_url, ws_url)
 	if ok {
 		vb.ariController = aricontroller
 	} else {
@@ -393,28 +408,53 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 		return nil, false
 	}
 
+	// Check which STT/TTS provider to use
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+
 	if OPMODE == "text" {
-		sttprovider, ok := deepgram.CreateProvider("ulaw")
-		if ok {
-			vb.sttprovider = sttprovider
+		if useGoogle {
+			sttprovider, ok := google.CreateProvider("ulaw")
+			if ok {
+				vb.googleSTTProvider = sttprovider
+			} else {
+				return nil, false
+			}
 		} else {
-			return nil, false
+			sttprovider, ok := deepgram.CreateProvider("ulaw")
+			if ok {
+				vb.sttprovider = sttprovider
+			} else {
+				return nil, false
+			}
 		}
 	}
 
 	if OPMODE == "text" || OPMODE == "hybrid" {
-		ttsprovider, ok := deepgram.CreateTTSDeepgram()
-		if ok {
-			vb.ttsprovider = ttsprovider
+		if useGoogle {
+			ttsprovider, ok := google.CreateTTSGoogle()
+			if ok {
+				vb.googleTTSProvider = ttsprovider
+			} else {
+				return nil, false
+			}
 		} else {
-			return nil, false
+			ttsprovider, ok := deepgram.CreateTTSDeepgram()
+			if ok {
+				vb.ttsprovider = ttsprovider
+			} else {
+				return nil, false
+			}
 		}
 	}
 
-	chatbot, ok := voiceai.CreateOPENAIWebsocketDialogController("", OPMODE)
+	// Create Google Translate provider
+	translateProvider, ok := google.NewGoogleTranslateProvider()
 	if ok {
-		vb.chatController = chatbot
+		vb.translateProvider = translateProvider
+		// Set translation callback
+		vb.translateProvider.SetTranslationCallback(vb.HandleTranslationResults)
 	} else {
+		log.Error("Failed to create Google Translate provider")
 		return nil, false
 	}
 
@@ -422,12 +462,19 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 	vb.ariController.SetCallbacks(vb)
 
 	if OPMODE == "text" {
-		vb.sttprovider.SetCallbacks(vb)
+		if useGoogle {
+			vb.googleSTTProvider.SetCallbacks(vb)
+		} else {
+			vb.sttprovider.SetCallbacks(vb)
+		}
 	}
 	if OPMODE == "text" || OPMODE == "hybrid" {
-		vb.ttsprovider.SetCallbacks(vb)
+		if useGoogle {
+			vb.googleTTSProvider.SetCallbacks(vb)
+		} else {
+			vb.ttsprovider.SetCallbacks(vb)
+		}
 	}
-	vb.chatController.SetCallbacks(vb)
 	vb.remoteCommander.SetCallBacks(vb)
 
 	return &vb, true
@@ -435,6 +482,23 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 
 func (v *VoiceBot) GoBotGo() {
 	v.ariController.Connect()
+}
+
+// Helper functions to get the correct STT/TTS provider
+func (v *VoiceBot) getSTTProvider() interface{} {
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		return v.googleSTTProvider
+	}
+	return v.sttprovider
+}
+
+func (v *VoiceBot) getTTSProvider() interface{} {
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		return v.googleTTSProvider
+	}
+	return v.ttsprovider
 }
 
 func (v *VoiceBot) initializeCommands() {
@@ -598,15 +662,18 @@ func (v VoiceBot) terminateCall(callid string) {
 	call.setClosing()
 	v.cancelDelayedCommands(callid)
 
-	chatend := v.chatController.DialogComplete(callid)
-	if chatend {
-		log.Info("BOT:terminateCall", "Status", "ChatCompleteSuccess")
-	} else {
-		log.Info("BOT:terminateCall", "Status", "ChatCompleteFailed")
-	}
+	// Translation doesn't need dialog completion
+	log.Info("BOT:terminateCall", "Status", "TranslationComplete")
+
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
 
 	if OPMODE == "text" {
-		sttend := v.sttprovider.EndCall(callid)
+		var sttend bool
+		if useGoogle {
+			sttend = v.googleSTTProvider.EndCall(callid)
+		} else {
+			sttend = v.sttprovider.EndCall(callid)
+		}
 		if sttend {
 			log.Info("BOT:terminateCall", "Status", "STTStopSuccess")
 		} else {
@@ -615,7 +682,12 @@ func (v VoiceBot) terminateCall(callid string) {
 	}
 
 	if OPMODE == "text" || OPMODE == "hybrid" {
-		ttsend := v.ttsprovider.EndCall(callid)
+		var ttsend bool
+		if useGoogle {
+			ttsend = v.googleTTSProvider.EndCall(callid)
+		} else {
+			ttsend = v.ttsprovider.EndCall(callid)
+		}
 		if ttsend {
 			log.Info("BOT:terminateCall", "Status", "TTSStopSuccess")
 		} else {
@@ -660,52 +732,69 @@ func (v VoiceBot) HandleNewCall(ci ariman.CallInfo) bool {
 
 	vbcall.setUDPProxy(udpProxy)
 
+	// Add call to callMap early to avoid race conditions with STT callbacks
+	v.addCall(&vbcall)
+
+	// Check which STT/TTS provider to use
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+
 	if OPMODE == "text" {
-		ok = v.sttprovider.NewCall(vbcall.getID(), v.defaultmode, v.defaultlanguage, v.commandWord, udpProxy)
+		if useGoogle {
+			ok = v.googleSTTProvider.NewCall(vbcall.getID(), v.defaultmode, v.defaultlanguage, v.commandWord, udpProxy)
+		} else {
+			ok = v.sttprovider.NewCall(vbcall.getID(), v.defaultmode, v.defaultlanguage, v.commandWord, udpProxy)
+		}
 		if !ok {
+			v.removeCall(vbcall.getID())
 			udpProxy.Stop()
 			return ok
 		}
 	}
 
 	if OPMODE == "text" || OPMODE == "hybrid" {
-		ok = v.ttsprovider.NewCall(vbcall.getID(), udpProxy)
+		if useGoogle {
+			ok = v.googleTTSProvider.NewCall(vbcall.getID(), udpProxy)
+		} else {
+			ok = v.ttsprovider.NewCall(vbcall.getID(), udpProxy)
+		}
 		if !ok {
 			if OPMODE == "text" {
-				v.sttprovider.EndCall(vbcall.getID())
+				if useGoogle {
+					v.googleSTTProvider.EndCall(vbcall.getID())
+				} else {
+					v.sttprovider.EndCall(vbcall.getID())
+				}
 			}
+			v.removeCall(vbcall.getID())
 			udpProxy.Stop()
 			return ok
 		}
 	}
 
-	ok = v.chatController.NewDialog(vbcall.getID(), udpProxy)
-	if !ok {
-		log.Error("BOT:HandleNewCall", "callid", ci.CallID, "error", "Failed to create dialog")
-		if OPMODE == "text" {
-			v.ttsprovider.EndCall(vbcall.getID())
-			v.sttprovider.EndCall(vbcall.getID())
-		} else if OPMODE == "hybrid" {
-			v.ttsprovider.EndCall(vbcall.getID())
-		}
-		udpProxy.Stop()
-		return ok
-	}
+	// Translation doesn't need dialog creation - it's always ready
 
 	ok = v.remoteCommander.NewCall(vbcall.getID(), ci.Vars)
 	if !ok {
-		v.chatController.DialogComplete(vbcall.getID())
+		// Translation doesn't need dialog completion
 		if OPMODE == "text" {
-			v.ttsprovider.EndCall(vbcall.getID())
-			v.sttprovider.EndCall(vbcall.getID())
+			if useGoogle {
+				v.googleTTSProvider.EndCall(vbcall.getID())
+				v.googleSTTProvider.EndCall(vbcall.getID())
+			} else {
+				v.ttsprovider.EndCall(vbcall.getID())
+				v.sttprovider.EndCall(vbcall.getID())
+			}
 		} else if OPMODE == "hybrid" {
-			v.ttsprovider.EndCall(vbcall.getID())
+			if useGoogle {
+				v.googleTTSProvider.EndCall(vbcall.getID())
+			} else {
+				v.ttsprovider.EndCall(vbcall.getID())
+			}
 		}
+		v.removeCall(vbcall.getID())
 		udpProxy.Stop()
 		return ok
 	}
-
-	v.addCall(&vbcall)
 
 	callinfojson, err := json.Marshal(ci.Vars)
 	callinfotext := ""
@@ -808,7 +897,12 @@ func (v VoiceBot) SendText(callid string, text string) {
 		text = text + truncatedMessage
 	}
 
-	v.ttsprovider.AddText(callid, text, "voicebot", "en-US")
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		v.googleTTSProvider.AddText(callid, text, "voicebot", "en-US")
+	} else {
+		v.ttsprovider.AddText(callid, text, "voicebot", "en-US")
+	}
 }
 
 func (v VoiceBot) FlushText(callid string) {
@@ -822,21 +916,38 @@ func (v VoiceBot) FlushText(callid string) {
 		log.Error("BOT:FlushText", "callid", callid, "error", "Call not found")
 		return
 	}
-	v.ttsprovider.FlushResponseText(callid)
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		v.googleTTSProvider.FlushResponseText(callid)
+	} else {
+		v.ttsprovider.FlushResponseText(callid)
+	}
 }
 
 func (v VoiceBot) CancelText(callid string) {
 	log.Debug("BOT:CancelText", "callid", callid)
-	if v.ttsprovider == nil {
-		log.Error("BOT:CancelText", "callid", callid, "error", "TTS provider not initialized")
-		return
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		if v.googleTTSProvider == nil {
+			log.Error("BOT:CancelText", "callid", callid, "error", "Google TTS provider not initialized")
+			return
+		}
+	} else {
+		if v.ttsprovider == nil {
+			log.Error("BOT:CancelText", "callid", callid, "error", "TTS provider not initialized")
+			return
+		}
 	}
 	_, ok := v.getCall(callid)
 	if !ok {
 		log.Error("BOT:CancelText", "callid", callid, "error", "Call not found")
 		return
 	}
-	v.ttsprovider.CancelText(callid)
+	if useGoogle {
+		v.googleTTSProvider.CancelText(callid)
+	} else {
+		v.ttsprovider.CancelText(callid)
+	}
 }
 
 func (v VoiceBot) HangupCall(callid string) {
@@ -875,71 +986,64 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 
 	if level != "passive" {
 		if level == "conversationalai-vad-start" {
-			v.ttsprovider.CancelText(callid)
-			v.chatController.ExternalVADStart(callid, "")
+			// Cancel any ongoing TTS
+			useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+			if useGoogle {
+				if v.googleTTSProvider != nil {
+					v.googleTTSProvider.CancelText(callid)
+				}
+			} else {
+				v.ttsprovider.CancelText(callid)
+			}
 		} else {
-			v.chatController.ExternalVADText(callid, text, level)
+			// Translate the text and send to TTS
+			if v.translateProvider != nil {
+				v.translateProvider.TranslateText(callid, text)
+			} else {
+				log.Error("BOT:HandleTranscriptResults", "callid", callid, "error", "Translation provider not available")
+			}
 		}
 	}
 
 	return ok
 }
 
+// HandleTranslationResults handles translation results and sends to TTS
+func (v VoiceBot) HandleTranslationResults(callid string, translatedText string, sourceLanguage string, targetLanguage string) bool {
+	log.Info("BOT:HandleTranslationResults", 
+		"callid", callid, 
+		"translated", translatedText, 
+		"source", sourceLanguage, 
+		"target", targetLanguage)
+
+	_, ok := v.getCall(callid)
+	if !ok {
+		log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Call not found")
+		return false
+	}
+
+	// Send translated text to TTS
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		if v.googleTTSProvider != nil {
+			v.googleTTSProvider.AddText(callid, translatedText, "translation", targetLanguage)
+		} else {
+			log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Google TTS provider not available")
+			return false
+		}
+	} else {
+		v.ttsprovider.AddText(callid, translatedText, "translation", targetLanguage)
+	}
+
+	return true
+}
+
 // END DeepgramSTTCallBackHandler Interface
 
-// AIDialogControllerCallBackHander Interface
+// Translation doesn't use dialog completion - this is kept for compatibility
 func (v VoiceBot) HandleDialogComplete(dialogid string, funcname string, parameters string, dialog string, prompt string) bool {
 	log.Info("BOT:HandleDialogComplete", "dialogid", dialogid, "funcname", funcname, "parameters", parameters, "dialog", dialog, "prompt", prompt)
-
-	if OPMODE == "audio" {
-		// check remote processing, then local processing
-		if !v.processRemoteCommand(dialogid, funcname, parameters, dialog) {
-			go v.DoCommand(dialogid, funcname, parameters)
-		} else {
-			log.Info("BOT:HandleDialogComplete", "dialogid", dialogid, "status", "RemoteCommandCreateSuccess")
-			// cancel delayed commands
-			v.cancelDelayedCommands(dialogid)
-			// cancel any pending text as we've moved on
-			v.CancelText(dialogid)
-		}
-
-		return true
-	}
-
-	if v.ttsprovider.IsStreaming(dialogid) {
-		log.Info("BOT:HandleDialogComplete", "dialogid", dialogid, "status", "StreamingDelay")
-	}
-
-	// check to see if we are in a current playback, if so wait until it's done
-	go func() {
-		waited := 0
-		// only wait 20 seconds max
-		for v.ttsprovider.IsStreaming(dialogid) && waited < 200 {
-			time.Sleep(100 * time.Millisecond)
-			waited++
-			if waited%10 == 0 {
-				log.Info("BOT:HandleDialogComplete", "dialogid", dialogid, "status", "WaitingForPlayback")
-			}
-		}
-
-		if waited >= 200 {
-			log.Error("BOT:HandleDialogComplete", "dialogid", dialogid, "error", "PlaybackTimeout")
-		} else {
-			log.Info("BOT:HandleDialogComplete", "dialogid", dialogid, "status", "PlaybackComplete")
-			time.Sleep(100 * time.Millisecond)
-		}
-		// check remote processing, then local processing
-		if !v.processRemoteCommand(dialogid, funcname, parameters, dialog) {
-			go v.DoCommand(dialogid, funcname, parameters)
-		} else {
-			log.Info("BOT:HandleDialogComplete", "dialogid", dialogid, "status", "RemoteCommandCreateSuccess")
-			// cancel delayed commands
-			v.cancelDelayedCommands(dialogid)
-			// cancel any pending text as we've moved on
-			v.CancelText(dialogid)
-		}
-	}()
-
+	// Translation doesn't need dialog completion - return true to indicate success
 	return true
 }
 
@@ -957,7 +1061,19 @@ func (v VoiceBot) HandleDialogContinueComplete(dialogid string, prompt string) b
 
 func (v VoiceBot) HandleDialogSpeechDetected(dialogid string, prompt string) bool {
 	log.Info("BOT:HandleDialogSpeechDetected", "dialogid", dialogid)
-	if v.ttsprovider != nil && v.ttsprovider.IsStreaming(dialogid) {
+	// For translation, cancel any ongoing TTS when speech is detected
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	var isStreaming bool
+	if useGoogle {
+		if v.googleTTSProvider != nil {
+			isStreaming = v.googleTTSProvider.IsStreaming(dialogid)
+		}
+	} else {
+		if v.ttsprovider != nil {
+			isStreaming = v.ttsprovider.IsStreaming(dialogid)
+		}
+	}
+	if isStreaming {
 		log.Info("BOT:HandleDialogSpeechDetected", "dialogid", dialogid, "status", "CancelingTextPlayback")
 		v.CancelText(dialogid)
 	}
@@ -995,17 +1111,11 @@ func (v VoiceBot) HandleDialogCommands(dialogid string, commands []rclocal.Voice
 
 func (v VoiceBot) HandleDialogFunctions(dialogid string, functions []rclocal.StudioTool, prompt string) bool {
 	log.Info("BOT:HandleDialogFunctions", "callid", dialogid)
+	// Translation doesn't use dialog functions - this is kept for compatibility
 	for _, function := range functions {
 		log.Info("BOT:HandleDialogFunctions", "callid", dialogid, "function", function.Tool.Name, "parameters", function.Tool.Parameters)
 	}
-	ok, functionset := ConvertStudioToolsToOpenAITools(functions)
-	if ok {
-		v.chatController.UpdateDialog(dialogid, functionset, prompt)
-		log.Debug("BOT:HandleDialogFunctions", "callid", dialogid, "functionset", functionset)
-	} else {
-		log.Error("BOT:HandleDialogFunctions", "callid", dialogid, "error", "Failed to build function set")
-	}
-
+	log.Info("BOT:HandleDialogFunctions", "callid", dialogid, "status", "TranslationMode - FunctionsIgnored")
 	return true
 }
 

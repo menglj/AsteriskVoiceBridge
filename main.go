@@ -22,7 +22,16 @@ var log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 func main() {
 	log.Info("No rest for the wicked.")
-	vb, ok := voicebot.CreateVoiceBot("tango", "conversationalai", "en-US")
+	
+	// Get language from environment variable, default to en-US for translation
+	language := os.Getenv("STT_LANGUAGE")
+	if language == "" {
+		language = "en-US" // Default to English for phone translation
+	}
+	
+	log.Info("Using STT language", "language", language)
+	
+	vb, ok := voicebot.CreateVoiceBot("tango", "conversationalai", language)
 	if !ok {
 		log.Error("Failed to create VoiceBot")
 		return

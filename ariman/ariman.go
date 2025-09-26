@@ -176,19 +176,19 @@ func (sc serviceCall) getInfo() CallInfo {
 
 // TODO:  add end event handling and context so we can restart the audio if required.
 func (sc *serviceCall) startSilence() bool {
-	log.Info("ARI:startSilence", "Status", "SilenceStarting")
+	// log.Info("ARI:startSilence", "Status", "SilenceStarting")
 	playHandle, err := sc.internalChannel.Play(sc.internalChannel.Key().ID, "sound:longsilence")
 	if err != nil {
 		log.Error("ARI:failed to play silence on user channel", "error", err)
 		return false
 	}
-	log.Info("ARI:startSilence", "Status", "SilenceStarted")
+	// log.Info("ARI:startSilence", "Status", "SilenceStarted")
 	sc.silencePlayback = playHandle
 	return true
 }
 
 func maintainSilence(ctx context.Context, sc *serviceCall, wg *sync.WaitGroup) {
-	log.Info("ARI:maintainSilence", "Status", "StartingSilence")
+	// log.Info("ARI:maintainSilence", "Status", "StartingSilence")
 
 	if sc == nil {
 		log.Error("ARI:maintainSilence", "Status", "ServiceCallNotSet")
@@ -227,7 +227,7 @@ func maintainSilence(ctx context.Context, sc *serviceCall, wg *sync.WaitGroup) {
 			//log.Info("silence playback complete")
 			if !cancelled {
 				//log.Info("Restarting silence")
-				log.Info("ARI:maintainSilence", "Status", "RestartingSilence")
+				// log.Info("ARI:maintainSilence", "Status", "RestartingSilence")
 				sc.startSilence()
 			} else {
 				log.Info("ARI:maintainSilence", "Status", "NotRestartingSilence")
@@ -494,6 +494,7 @@ func handleNewCall(c *Connector, userChannel *ari.ChannelHandle) bool {
 	mediaurl := HOST_ADD + ":" + strconv.Itoa(freePort)
 	extid := userChannel.ID() + "-external"
 	log.Info("ARI:handleNewCall", "MediaFormat", FORMAT())
+	log.Info("ARI:handleNewCall", "ExternalHost", mediaurl)
 	extopts := ari.ExternalMediaOptions{App: ariApp, ExternalHost: mediaurl, ChannelID: extid, Format: FORMAT()}
 
 	externalChannel, err := userChannel.ExternalMedia(extopts)
@@ -628,7 +629,7 @@ func (c *Connector) Connect() bool {
 
 			dialkey := v.Channel.Dialplan.Exten + "@" + v.Channel.Dialplan.Context
 			log.Info("ARI:Connect", "DialKey", dialkey)
-			if dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
+			if dialkey == "8888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
 				log.Info("ARI:Connect", "DialKey", "Matched")
 				go handleNewCall(c, c.ariClient.Channel().Get(v.Key(ari.ChannelKey, v.Channel.ID)))
 			} else if chanIDSuffix == "call" {
