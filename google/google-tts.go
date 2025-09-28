@@ -201,6 +201,17 @@ func (tts *ttsCall) Pipe(data []byte) bool {
 			}
 			log.Info("TTS:Pipe", "Event", "WritingData", "Length", len(newslice))
 
+			// Send wakefile signal to start audio playback (only for first chunk)
+			if len(tts.voiceStack) == 0 { // This is the first chunk being processed
+				log.Debug("TTS:Pipe", "Event", "WakefileSend")
+				select {
+				case tts.wakefile <- true:
+					log.Debug("TTS:Pipe", "Event", "WakeFileSent")
+				default:
+					log.Debug("TTS:Pipe", "Event", "WakeFileSkipped")
+				}
+			}
+
 			log.Debug("TTS:Pipe", "Event", "WritingData")
 			tts.iowr.Write(newslice)
 			log.Debug("TTS:Pipe", "Event", "DataWritten")
@@ -378,17 +389,7 @@ func (tts *ttsCall) listenForPlaybackDone() {
 				tts.playbackCompleteCallBack()
 			}
 			
-			// Always reset deadfile state after TTS playback completion
-			// This ensures that the system can receive new user audio regardless of text stack state
-			go func() {
-				time.Sleep(100 * time.Millisecond) // Small delay to ensure callback is processed
-				select {
-				case tts.wakefile <- true:
-					log.Info("TTS:listenForPlaybackDone", "Event", "WakeFileSent")
-				default:
-					log.Warn("TTS:listenForPlaybackDone", "Event", "WakeFileSkipped", "Reason", "Channel full")
-				}
-			}()
+			// Wakefile signal is already sent in Pipe method, no need to send again
 		case <-tts.signalStreamDone:
 			log.Info("TTS:listenForPlaybackDone", "Event", "StreamDone")
 			return
