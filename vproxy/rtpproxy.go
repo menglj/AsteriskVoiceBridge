@@ -449,10 +449,13 @@ func (p *IOProxy) StreamFrom(r io.Reader, streamdone chan bool, wakefile chan bo
 			engaged = true
 			continue
 		case <-wakefile:
+			log.Info("RTP:StreamFrom", "Event", "WakeFileReceived", "DeadFile", deadfile)
 			if deadfile {
 				log.Info("RTP:StreamFrom", "Event", "WakeFile")
 				deadfile = false
 				filerevived <- true
+			} else {
+				log.Info("RTP:StreamFrom", "Event", "WakeFileIgnored", "Reason", "DeadFile already false")
 			}
 			continue
 		case <-p.syncout:

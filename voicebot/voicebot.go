@@ -898,6 +898,14 @@ func (v VoiceBot) SendText(callid string, text string) {
 	}
 
 	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	
+	// Pause STT during TTS playback to enable interrupt detection
+	if useGoogle {
+		if v.googleSTTProvider != nil {
+			v.googleSTTProvider.PauseCall(callid)
+		}
+	}
+	
 	if useGoogle {
 		v.googleTTSProvider.AddText(callid, text, "voicebot", "en-US")
 	} else {
@@ -995,6 +1003,31 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 			} else {
 				v.ttsprovider.CancelText(callid)
 			}
+		} else if level == "interrupt" {
+			// Handle interrupt during TTS playback
+			log.Info("BOT:HandleTranscriptResults", "callid", callid, "status", "InterruptDetected", "text", text)
+			
+			// Cancel TTS playback
+			useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+			if useGoogle {
+				if v.googleTTSProvider != nil {
+					v.googleTTSProvider.CancelText(callid)
+				}
+			} else {
+				v.ttsprovider.CancelText(callid)
+			}
+			
+			// Resume STT after interrupt to allow normal processing
+			if useGoogle {
+				if v.googleSTTProvider != nil {
+					v.googleSTTProvider.ResumeCall(callid)
+				}
+			}
+			
+			// Process the interrupt text as normal translation
+			if v.translateProvider != nil {
+				v.translateProvider.TranslateText(callid, text)
+			}
 		} else {
 			// Translate the text and send to TTS
 			if v.translateProvider != nil {
@@ -1022,8 +1055,15 @@ func (v VoiceBot) HandleTranslationResults(callid string, translatedText string,
 		return false
 	}
 
-	// Send translated text to TTS
+	// Pause STT during TTS playback to enable interrupt detection
 	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		if v.googleSTTProvider != nil {
+			v.googleSTTProvider.PauseCall(callid)
+		}
+	}
+	
+	// Send translated text to TTS
 	if useGoogle {
 		if v.googleTTSProvider != nil {
 			v.googleTTSProvider.AddText(callid, translatedText, "translation", targetLanguage)
@@ -1195,6 +1235,15 @@ func (v VoiceBot) HandlePlaybackComplete(callid string, playbackid string) bool 
 		return false
 	}
 	log.Info("BOT:HandlePlaybackComplete", "callid", callid, "playbackid", playbackid)
+	
+	// Resume STT after TTS playback is complete
+	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+	if useGoogle {
+		if v.googleSTTProvider != nil {
+			v.googleSTTProvider.ResumeCall(callid)
+		}
+	}
+	
 	return true
 }
 

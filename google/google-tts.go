@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
+	"sync"
 	"github.com/asterisk/AsteriskVoiceBridge/vproxy"
 	texttospeech "cloud.google.com/go/texttospeech/apiv1"
 	"cloud.google.com/go/texttospeech/apiv1/texttospeechpb"
@@ -124,7 +124,7 @@ func (tts *ttsCall) initialize(playbackCompleteCB playbackCompleteCB) {
 	tts.signalStreamDone = make(chan bool)
 	tts.deadfile = make(chan bool)
 	tts.filerevived = make(chan bool)
-	tts.wakefile = make(chan bool)
+	tts.wakefile = make(chan bool, 10) // Add buffer to prevent blocking
 	tts.playbackCompleteCB = playbackCompleteCB
 	tts.engaged = true
 	tts.ctx, tts.cancel = context.WithCancel(context.Background())
@@ -200,10 +200,6 @@ func (tts *ttsCall) Pipe(data []byte) bool {
 				log.Info("TTS:Pipe", "Event", "CachePendingModBytes", "Length", len(modbytes))
 			}
 			log.Info("TTS:Pipe", "Event", "WritingData", "Length", len(newslice))
-
-			log.Debug("TTS:Pipe", "Event", "WakefileSend")
-			tts.wakefile <- true
-			log.Debug("TTS:Pipe", "Event", "WakefileSendComplete")
 
 			log.Debug("TTS:Pipe", "Event", "WritingData")
 			tts.iowr.Write(newslice)
@@ -317,6 +313,14 @@ func (tts *ttsCall) SpeakText(text string) error {
 
 	// Pipe the audio data
 	tts.Pipe(resp.AudioContent)
+	
+	// Send deadpacket to signal end of audio stream (like Deepgram does)
+	// This ensures vproxy detects the end of audio and sends deadfile signal
+	go func() {
+		time.Sleep(100 * time.Millisecond) // Small delay to ensure audio is processed
+		tts.AddDeadPacket()
+		log.Info("TTS:SpeakText", "callid", tts.callid, "status", "DeadPacketSent", "playbackID", tts.currentPlaybackID)
+	}()
 
 	return nil
 }
@@ -353,9 +357,8 @@ func (tts *ttsCall) listenForPlaybackDone() {
 		select {
 		case <-tts.filerevived:
 			log.Info("TTS:listenForPlaybackDone", "Event", "PlaybackStarted")
-			tts.mu.Lock()
-			tts.streaming = true
-			tts.mu.Unlock()
+			// Don't set streaming=true here as it's already managed by AddText/SendText
+			// This signal is just for internal state tracking
 		case <-tts.deadfile:
 			log.Info("TTS:listenForPlaybackDone", "Event", "PlaybackStopped")
 			// check the text stack
@@ -374,6 +377,18 @@ func (tts *ttsCall) listenForPlaybackDone() {
 				log.Info("TTS:listenForPlaybackDone", "Event", "TextStackEmpty")
 				tts.playbackCompleteCallBack()
 			}
+			
+			// Always reset deadfile state after TTS playback completion
+			// This ensures that the system can receive new user audio regardless of text stack state
+			go func() {
+				time.Sleep(100 * time.Millisecond) // Small delay to ensure callback is processed
+				select {
+				case tts.wakefile <- true:
+					log.Info("TTS:listenForPlaybackDone", "Event", "WakeFileSent")
+				default:
+					log.Warn("TTS:listenForPlaybackDone", "Event", "WakeFileSkipped", "Reason", "Channel full")
+				}
+			}()
 		case <-tts.signalStreamDone:
 			log.Info("TTS:listenForPlaybackDone", "Event", "StreamDone")
 			return
@@ -382,10 +397,16 @@ func (tts *ttsCall) listenForPlaybackDone() {
 }
 
 func (tts *ttsCall) playbackCompleteCallBack() {
+	log.Info("TTS:playbackCompleteCallBack", "callid", tts.callid, "currentPlaybackID", tts.currentPlaybackID, "hasCallback", tts.playbackCompleteCB != nil)
 	if tts.playbackCompleteCB != nil && tts.currentPlaybackID != "" {
+		log.Info("TTS:playbackCompleteCallBack", "callid", tts.callid, "status", "CallingCallback", "playbackID", tts.currentPlaybackID)
 		tts.playbackCompleteCB(tts.callid, tts.currentPlaybackID)
 		tts.currentPlaybackID = ""
+	} else {
+		log.Info("TTS:playbackCompleteCallBack", "callid", tts.callid, "status", "Skipped", "reason", "NoCallbackOrEmptyID")
 	}
+	
+	// Wakefile signal is already sent in listenForPlaybackDone, no need to send again
 }
 
 func (tts *ttsCall) resetPipe() {
@@ -506,6 +527,7 @@ func (tts TTSGoogle) SendText(callid string, text string, id string, language st
 	}
 
 	call.currentPlaybackID = id
+	log.Info("TTS:SendText", "callid", callid, "playbackID", id, "status", "SetPlaybackID")
 	err := call.SpeakText(text)
 	if err != nil {
 		log.Error("TTS:SendText", "ErrorOnSend", err)

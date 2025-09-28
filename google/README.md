@@ -53,10 +53,13 @@ Set the following environment variables to use Google STT/TTS:
 ```bash
 export USE_GOOGLE_STT_TTS=true
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/your/service-account-key.json
-export STT_LANGUAGE=en-US  # Source language for speech recognition
-export TTS_LANGUAGE=zh-CN  # Target language for speech synthesis
+export STT_LANGUAGE=en-US   # Source language for speech recognition
+export TTS_LANGUAGE=cmn-CN  # Target language for speech synthesis
 export TRANSLATE_SOURCE_LANGUAGE=en-US  # Source language for translation
 export TRANSLATE_TARGET_LANGUAGE=zh-CN  # Target language for translation
+
+# Optional: STT configuration
+export GOOGLE_STT_HEARTBEAT_INTERVAL=10s  # Heartbeat interval to prevent audio timeout
 ```
 
 #### Language Configuration
@@ -77,13 +80,13 @@ The `STT_LANGUAGE` environment variable controls the speech recognition language
 The `TTS_LANGUAGE` environment variable controls the speech synthesis language and automatically selects appropriate voice:
 
 - `en-US` - English (US) - Default, uses `en-US-Neural2-J`
-- `zh-CN` - Chinese (Simplified) - uses `zh-CN-Wavenet-A`
-- `zh-TW` - Chinese (Traditional) - uses `zh-TW-Wavenet-A`
+- `cmn-CN` - Chinese (Simplified) - uses `cmn-CN-Wavenet-B`
+- `cmn-TW` - Chinese (Traditional) - uses `cmn-TW-Wavenet-A`
 - `ja-JP` - Japanese - uses `ja-JP-Wavenet-A`
 - `ko-KR` - Korean - uses `ko-KR-Wavenet-A`
 - `es-ES` - Spanish - uses `es-ES-Neural2-A`
-- `fr-FR` - French - uses `fr-FR-Neural2-A`
-- `de-DE` - German - uses `de-DE-Neural2-A`
+- `fr-FR` - French - uses `fr-FR-Standard-F`
+- `de-DE` - German - uses `de-DE-Neural2-G`
 
 **Translation Languages:**
 The `TRANSLATE_SOURCE_LANGUAGE` and `TRANSLATE_TARGET_LANGUAGE` environment variables control the translation direction:
@@ -102,6 +105,50 @@ For a complete list of supported languages, see:
 - [Google Cloud Speech-to-Text language support](https://cloud.google.com/speech-to-text/docs/languages)
 - [Google Cloud Text-to-Speech voice list](https://cloud.google.com/text-to-speech/docs/voices)
 - [Google Cloud Translation language support](https://cloud.google.com/translate/docs/languages)
+
+#### Advanced Configuration
+
+**STT Heartbeat Configuration:**
+The `GOOGLE_STT_HEARTBEAT_INTERVAL` environment variable controls how often empty audio packets are sent to keep the stream alive:
+
+- `10s` - Default, good for most phone calls
+- `5s` - More frequent, for unstable connections
+- `15s` - Less frequent, for stable connections
+- `30s` - Minimal, for very stable connections
+
+**Troubleshooting Audio Timeout Errors:**
+
+The system now automatically handles audio timeouts during TTS playback by pausing STT streams. If you still encounter timeout errors:
+
+1. **Reduce heartbeat interval:**
+   ```bash
+   export GOOGLE_STT_HEARTBEAT_INTERVAL=5s
+   ```
+
+2. **Check network stability** - Ensure stable internet connection
+
+3. **Monitor logs** - Look for patterns in timeout occurrences
+
+4. **Adjust audio quality** - Consider using lower bitrate if network is unstable
+
+**Automatic STT Pause/Resume with Interrupt Detection:**
+
+The system automatically:
+- Pauses STT when TTS playback starts (prevents audio timeout)
+- Enables interrupt detection during TTS playback
+- Continues to process audio for interrupt detection
+- Resumes STT when TTS playback completes or is interrupted
+- Cancels TTS and processes interrupt speech immediately
+- Logs pause/resume and interrupt events for debugging
+
+**Interrupt Detection:**
+- During TTS playback, STT continues to monitor for user speech
+- When user speaks during TTS, the system:
+  1. Immediately cancels TTS playback
+  2. Resumes normal STT processing
+  3. Translates the interrupt speech
+  4. Plays the translated response
+- This enables natural conversation flow with interruptions
 
 ### 3. Dependencies
 
@@ -199,6 +246,32 @@ The Google STT implementation uses the following default configuration:
 
 Google Cloud STT/TTS pricing is typically more cost-effective than Deepgram for most use cases. Check the current Google Cloud pricing for detailed information.
 
+## 静默音频流方案（模拟Deepgram）
+
+Google STT采用静默音频流方案，模拟Deepgram的持续音频流处理方式，防止音频超时并保持自然中断功能。
+
+### 工作流程
+
+1. **用户说话** → STT识别 → 翻译 → TTS播放
+2. **TTS播放开始** → 启用静默模式 → 发送静默音频包
+3. **用户中断** → 检测到语音 → 取消TTS → 禁用静默模式
+4. **TTS播放结束** → 禁用静默模式
+
+### 静默音频机制
+
+- **静默模式**：TTS播放期间发送预生成的静默音频包
+- **持续连接**：保持Google STT连接活跃，防止超时
+- **自然中断**：用户说话时自然检测到中断
+- **编码支持**：支持μ-law和Linear 16-bit编码格式
+
+### 优势
+
+1. **模拟Deepgram**：采用与Deepgram相同的持续音频流方式
+2. **防止超时**：静默音频包保持连接活跃
+3. **自然中断**：用户说话时自然检测到中断
+4. **简化逻辑**：不需要复杂的暂停/恢复机制
+5. **稳定可靠**：减少状态管理的复杂性
+
 ## Troubleshooting
 
 ### Common Issues
@@ -207,6 +280,8 @@ Google Cloud STT/TTS pricing is typically more cost-effective than Deepgram for 
 2. **API Not Enabled**: Verify that Speech-to-Text and Text-to-Speech APIs are enabled
 3. **Quota Exceeded**: Check your Google Cloud quotas and billing
 4. **Network Issues**: Ensure proper network connectivity to Google Cloud APIs
+5. **Audio Timeout**: The silent audio streaming should prevent timeout errors
+6. **Interrupt Detection**: Ensure silent mode is properly enabled/disabled during TTS playback
 
 ### Logging
 

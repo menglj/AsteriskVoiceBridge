@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/asterisk/AsteriskVoiceBridge/vproxy"
 	"golang.org/x/exp/slog"
@@ -45,6 +46,24 @@ func getEncoding() speechpb.RecognitionConfig_AudioEncoding {
 		return speechpb.RecognitionConfig_LINEAR16
 	}
 	return speechpb.RecognitionConfig_MULAW
+}
+
+// getSilentAudioPacket returns a silent audio packet for the current encoding
+func getSilentAudioPacket() []byte {
+	encoding := vproxy.GetRTP_MODE()
+	if encoding == "l16" {
+		// Linear 16-bit silence (all zeros)
+		size := vproxy.GetRTP_PAYLOAD_SIZE()
+		return make([]byte, size)
+	} else {
+		// μ-law silence (0x7F for μ-law silence)
+		size := vproxy.GetRTP_PAYLOAD_SIZE()
+		silentPacket := make([]byte, size)
+		for i := range silentPacket {
+			silentPacket[i] = 0x7F // μ-law silence value
+		}
+		return silentPacket
+	}
 }
 
 var log = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -87,7 +106,57 @@ type googleSTTClient struct {
 	// context for cancellation
 	ctx    context.Context
 	cancel context.CancelFunc
+	// pause state for TTS playback
+	paused bool
+	pauseMu sync.RWMutex
+	// interrupt detection during TTS playback
+	interruptEnabled bool
+	interruptMu sync.RWMutex
+	// No longer using silent mode - let Asterisk sound:longsilence handle continuous audio
 }
+
+// Pause pauses the STT stream to prevent audio timeout during TTS playback
+// but keeps interrupt detection enabled
+func (c *googleSTTClient) Pause() {
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	c.paused = true
+	
+	c.interruptMu.Lock()
+	c.interruptEnabled = true
+	c.interruptMu.Unlock()
+	
+	log.Info("STT:Pause", "callid", c.callid, "status", "PausedWithInterrupt")
+}
+
+// Resume resumes the STT stream after TTS playback
+func (c *googleSTTClient) Resume() {
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	c.paused = false
+	
+	c.interruptMu.Lock()
+	c.interruptEnabled = false
+	c.interruptMu.Unlock()
+	
+	log.Info("STT:Resume", "callid", c.callid, "status", "Resumed")
+}
+
+// IsPaused returns whether the STT stream is currently paused
+func (c *googleSTTClient) IsPaused() bool {
+	c.pauseMu.RLock()
+	defer c.pauseMu.RUnlock()
+	return c.paused
+}
+
+// IsInterruptEnabled returns whether interrupt detection is enabled
+func (c *googleSTTClient) IsInterruptEnabled() bool {
+	c.interruptMu.RLock()
+	defer c.interruptMu.RUnlock()
+	return c.interruptEnabled
+}
+
+// No longer using silent mode - let Asterisk sound:longsilence handle continuous audio
 
 func (c *googleSTTClient) setMode(mode string) {
 	c.mu.Lock()
@@ -140,6 +209,9 @@ func (c *googleSTTClient) start() bool {
 					Model:          "phone_call", // Use phone call model for better accuracy
 					EnableAutomaticPunctuation: true,
 					EnableWordTimeOffsets: true,
+					// Add audio channel configuration for better phone call handling
+					AudioChannelCount: 1,
+					EnableSeparateRecognitionPerChannel: false,
 				},
 				InterimResults: true,
 			},
@@ -174,8 +246,71 @@ func (c *googleSTTClient) start() bool {
 			log.Error("STT:Call", "StreamError", err)
 		}
 	}()
+	
+	// Start heartbeat to keep stream alive
+	go c.heartbeat()
 
 	return true
+}
+
+// heartbeat sends periodic empty audio packets to keep the stream alive
+func (c *googleSTTClient) heartbeat() {
+	// Get heartbeat interval from environment variable, default to 10 seconds
+	heartbeatInterval := 10 * time.Second
+	if interval := os.Getenv("GOOGLE_STT_HEARTBEAT_INTERVAL"); interval != "" {
+		if duration, err := time.ParseDuration(interval); err == nil {
+			heartbeatInterval = duration
+		}
+	}
+	
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	
+	log.Info("STT:heartbeat", "Event", "HeartbeatStarted", "interval", heartbeatInterval)
+	
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			if c.stream != nil && !c.IsPaused() {
+				// Send heartbeat in normal mode to keep Google STT connection alive
+				// This prevents audio timeout during periods of silence
+				silentPacket := getSilentAudioPacket()
+				req := &speechpb.StreamingRecognizeRequest{
+					StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
+						AudioContent: silentPacket,
+					},
+				}
+				
+				if err := c.stream.Send(req); err != nil {
+					log.Error("STT:heartbeat", "Error", "Failed to send heartbeat", "error", err)
+				} else {
+					log.Info("STT:heartbeat", "Event", "SilentPacketSent - NormalMode")
+				}
+			} else if c.IsPaused() && c.IsInterruptEnabled() {
+				// Send heartbeat in interrupt mode to detect user speech during TTS
+				silentPacket := getSilentAudioPacket()
+				req := &speechpb.StreamingRecognizeRequest{
+					StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
+						AudioContent: silentPacket,
+					},
+				}
+				
+				if err := c.stream.Send(req); err != nil {
+					log.Error("STT:heartbeat", "Error", "Failed to send heartbeat", "error", err)
+				} else {
+					log.Info("STT:heartbeat", "Event", "SilentPacketSent - InterruptMode")
+				}
+			} else {
+				log.Debug("STT:heartbeat", "Event", "Skipped - Paused")
+			}
+			c.mu.Unlock()
+			
+		case <-c.ctx.Done():
+			log.Debug("STT:heartbeat", "Event", "HeartbeatStopped")
+			return
+		}
+	}
 }
 
 func (c *googleSTTClient) Write(data []byte) (int, error) {
@@ -186,6 +321,24 @@ func (c *googleSTTClient) Write(data []byte) (int, error) {
 		return 0, fmt.Errorf("stream not initialized")
 	}
 
+	// Skip empty data packets
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	// Always send real audio data to Google STT (like Deepgram approach)
+	// The sound:longsilence from Asterisk will provide continuous audio stream
+
+	// If paused but interrupt detection is enabled, still send audio for interrupt detection
+	if c.IsPaused() && !c.IsInterruptEnabled() {
+		log.Debug("STT:Write", "callid", c.callid, "status", "Skipped - Paused")
+		return len(data), nil
+	}
+	
+	if c.IsPaused() && c.IsInterruptEnabled() {
+		log.Debug("STT:Write", "callid", c.callid, "status", "InterruptDetection")
+	}
+
 	req := &speechpb.StreamingRecognizeRequest{
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
 			AudioContent: data,
@@ -193,6 +346,14 @@ func (c *googleSTTClient) Write(data []byte) (int, error) {
 	}
 
 	if err := c.stream.Send(req); err != nil {
+		// Check for specific errors that are not fatal
+		if strings.Contains(err.Error(), "Audio Timeout Error") ||
+		   strings.Contains(err.Error(), "OutOfRange") ||
+		   strings.Contains(err.Error(), "context deadline exceeded") {
+			log.Debug("STT:Write", "Event", "NonFatalError", "error", err)
+			return len(data), nil // Return success for non-fatal errors
+		}
+		
 		log.Error("STT:Write", "Error", "Failed to send audio data", "error", err)
 		return 0, err
 	}
@@ -208,6 +369,26 @@ func (c *googleSTTClient) handleResponses() {
 				log.Info("STT:handleResponses", "Event", "StreamEnded")
 				break
 			}
+			
+			// Check for specific Google Cloud errors
+			if strings.Contains(err.Error(), "Audio Timeout Error") {
+				log.Warn("STT:handleResponses", "Event", "AudioTimeout", "error", err)
+				// Audio timeout is not fatal, continue listening
+				continue
+			}
+			
+			if strings.Contains(err.Error(), "OutOfRange") {
+				log.Warn("STT:handleResponses", "Event", "OutOfRange", "error", err)
+				// Out of range error, continue listening
+				continue
+			}
+			
+			if strings.Contains(err.Error(), "context deadline exceeded") {
+				log.Warn("STT:handleResponses", "Event", "ContextDeadlineExceeded", "error", err)
+				// Context deadline exceeded, continue listening
+				continue
+			}
+			
 			log.Error("STT:handleResponses", "Error", "Failed to receive response", "error", err)
 			break
 		}
@@ -225,6 +406,19 @@ func (c *googleSTTClient) handleResponses() {
 			c.mu.Lock()
 			isFinal := result.IsFinal
 			c.mu.Unlock()
+
+			// If paused, only process transcripts for interrupt detection
+			if c.IsPaused() && c.IsInterruptEnabled() {
+				// Only process final results for interrupt detection
+				if isFinal && len(transcript) > 0 {
+					log.Info("STT:InterruptDetection", "callid", c.callid, "text", transcript)
+					// Send interrupt signal to voicebot
+					if c.transcriptCallback != nil {
+						c.transcriptCallback(c.callid, transcript, "interrupt")
+					}
+				}
+				continue
+			}
 
 			if isFinal {
 				log.Info("STT:MessageResponse", "Text", transcript)
@@ -440,6 +634,34 @@ func (d *GoogleSTTProvider) NewCall(callid string, mode string, language string,
 	}
 	return ok
 }
+
+/* Pause STT for a call (during TTS playback) */
+func (d *GoogleSTTProvider) PauseCall(callid string) bool {
+	d.mu.RLock()
+	client, exists := d.clientMap[callid]
+	d.mu.RUnlock()
+	
+	if exists && client != nil {
+		client.Pause()
+		return true
+	}
+	return false
+}
+
+/* Resume STT for a call (after TTS playback) */
+func (d *GoogleSTTProvider) ResumeCall(callid string) bool {
+	d.mu.RLock()
+	client, exists := d.clientMap[callid]
+	d.mu.RUnlock()
+	
+	if exists && client != nil {
+		client.Resume()
+		return true
+	}
+	return false
+}
+
+// No longer using silent mode - let Asterisk sound:longsilence handle continuous audio
 
 func (d *GoogleSTTProvider) terminateClient(callid string) bool {
 	d.mu.Lock()

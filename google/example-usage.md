@@ -36,16 +36,16 @@ docker run -it \
 
 ### English to Chinese Translation
 ```bash
-export STT_LANGUAGE=en-US  # Speech recognition (English)
-export TTS_LANGUAGE=zh-CN  # Speech synthesis (Chinese)
+export STT_LANGUAGE=en-US   # Speech recognition (English)
+export TTS_LANGUAGE=cmn-CN  # Speech synthesis (Chinese)
 export TRANSLATE_SOURCE_LANGUAGE=en-US  # Translation source
 export TRANSLATE_TARGET_LANGUAGE=zh-CN  # Translation target
 ```
 
 ### Chinese to English Translation
 ```bash
-export STT_LANGUAGE=zh-CN  # Speech recognition (Chinese)
-export TTS_LANGUAGE=en-US  # Speech synthesis (English)
+export STT_LANGUAGE=cmn-CN  # Speech recognition (Chinese)
+export TTS_LANGUAGE=en-US   # Speech synthesis (English)
 export TRANSLATE_SOURCE_LANGUAGE=zh-CN  # Translation source
 export TRANSLATE_TARGET_LANGUAGE=en-US  # Translation target
 ```
