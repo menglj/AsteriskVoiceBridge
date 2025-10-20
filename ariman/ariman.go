@@ -13,8 +13,12 @@
 package ariman
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -74,6 +78,11 @@ type serviceCall struct {
 	CTX                                            context.Context
 	cancelSilence                                  chan bool
 	continued                                      bool
+    // Dual translator topology
+    bridgeCA, bridgeAC                             *ari.BridgeHandle
+    custSpyCA, agentWhisperCA                      *ari.ChannelHandle
+    agentSpyAC, custWhisperAC                      *ari.ChannelHandle
+    extCA, extAC                                   *ari.ChannelHandle
 }
 
 func (sc *serviceCall) initialize() {
@@ -315,6 +324,8 @@ type Connector struct {
 	ctx                                         context.Context
 	extMediaPorts                               map[int]bool
 	calls                                       map[string]*serviceCall
+    // AMI config
+    amiHost, amiPort, amiUser, amiPass string
 }
 
 // Get a free port for external media
@@ -362,7 +373,14 @@ func CreateConnector(app string, username string, password string, url string, w
 		wsurl:    wsurl,
 	}
 	con.extMediaPorts = make(map[int]bool)
-	con.calls = make(map[string]*serviceCall)
+    con.calls = make(map[string]*serviceCall)
+    // AMI env config (optional)
+    con.amiHost = os.Getenv("AMI_HOST")
+    con.amiPort = os.Getenv("AMI_PORT")
+    if con.amiHost == "" { con.amiHost = "127.0.0.1" }
+    if con.amiPort == "" { con.amiPort = "5038" }
+    con.amiUser = os.Getenv("AMI_USERNAME")
+    con.amiPass = os.Getenv("AMI_PASSWORD")
 	return &con, true
 }
 
@@ -467,6 +485,91 @@ func manageExternalChannelSubscriptions(conn *Connector, c *ari.ChannelHandle, t
 	}
 }
 
+// watchAMI connects to AMI and listens for UserEvent(TranslatorStart)
+func (c *Connector) watchAMI() {
+    log.Info("AMI:watch", "host", c.amiHost, "port", c.amiPort)
+    // Minimal TCP client to AMI to avoid adding dependencies
+    // Note: For production, prefer a proper AMI library.
+    addr := c.amiHost + ":" + c.amiPort
+    conn, err := net.Dial("tcp", addr)
+    if err != nil {
+        log.Error("AMI:connect", "error", err)
+        return
+    }
+    defer conn.Close()
+
+    // Login
+    fmt.Fprintf(conn, "Action: Login\r\nUsername: %s\r\nSecret: %s\r\nEvents: on\r\n\r\n", c.amiUser, c.amiPass)
+
+    reader := bufio.NewReader(conn)
+    var lines []string
+    for {
+        line, err := reader.ReadString('\n')
+        if err != nil {
+            log.Error("AMI:read", "error", err)
+            return
+        }
+        line = strings.TrimRight(line, "\r\n")
+        if line == "" {
+            // end of an AMI event block
+            c.handleAMIEvent(lines)
+            lines = nil
+            continue
+        }
+        lines = append(lines, line)
+    }
+}
+
+func (c *Connector) handleAMIEvent(lines []string) {
+    if len(lines) == 0 {
+        return
+    }
+    // We only care UserEvent: TranslatorStart
+    kv := make(map[string]string)
+    var evtype string
+    for _, l := range lines {
+        if strings.HasPrefix(l, "Event:") {
+            evtype = strings.TrimSpace(strings.TrimPrefix(l, "Event:"))
+        } else {
+            parts := strings.SplitN(l, ":", 2)
+            if len(parts) == 2 {
+                k := strings.TrimSpace(parts[0])
+                v := strings.TrimSpace(parts[1])
+                kv[k] = v
+            }
+        }
+    }
+    if evtype != "UserEvent" {
+        return
+    }
+    if kv["UserEvent"] != "TranslatorStart" {
+        return
+    }
+    // Expect caller, callee, linkedid (optional)
+    caller := kv["caller"]
+    callee := kv["callee"]
+    if caller == "" || callee == "" {
+        log.Error("AMI:TranslatorStart", "error", "Missing caller/callee")
+        return
+    }
+    log.Info("AMI:TranslatorStart", "caller", caller, "callee", callee)
+    // From these channels, we need to obtain ari.ChannelHandle
+    // The IDs from AMI may not be exactly ARI IDs; attempt using Channel: header
+    // Fall back: find by callid prefix if present
+    cust := c.ariClient.Channel().Get(&ari.Key{Kind: ari.ChannelKey, ID: caller})
+    agent := c.ariClient.Channel().Get(&ari.Key{Kind: ari.ChannelKey, ID: callee})
+    if cust == nil || agent == nil {
+        log.Error("AMI:TranslatorStart", "error", "Failed to map channels to ARI")
+        return
+    }
+    // Build a transient serviceCall for bookkeeping
+    sc := &serviceCall{info: CallInfo{CallID: caller, AppKey: "voicebotdemo", DestMediaAddress: AST_ADD, DestMediaPort: 0, SrcMediaAddress: HOST_ADD, SrcMediaPort: 0}, internalChannel: cust}
+    sc.initialize()
+    c.addCall(sc)
+    // Setup dual translator
+    go c.setupDualTranslator(sc, agent)
+}
+
 func handleNewCall(c *Connector, userChannel *ari.ChannelHandle) bool {
 
 	// assume we are able to determine the Asterisk side external media address and port
@@ -490,7 +593,7 @@ func handleNewCall(c *Connector, userChannel *ari.ChannelHandle) bool {
 		return false
 	}
 
-	// Create an external media channel based on the user channel
+    // Create an external media channel based on the user channel (legacy single path for silence maintenance)
 	mediaurl := HOST_ADD + ":" + strconv.Itoa(freePort)
 	extid := userChannel.ID() + "-external"
 	log.Info("ARI:handleNewCall", "MediaFormat", FORMAT())
@@ -587,6 +690,90 @@ func handleNewCall(c *Connector, userChannel *ari.ChannelHandle) bool {
 	return true
 }
 
+// setupDualTranslator builds two bridges (C→A, A→C) with corresponding snoops and external media
+func (c *Connector) setupDualTranslator(call *serviceCall, agentChan *ari.ChannelHandle) {
+    log.Info("ARI:setupDualTranslator", "call", call.getID())
+
+    // Customer is the original user channel in the call, agent is the new chan
+    custChan := call.internalChannel
+    if custChan == nil || agentChan == nil {
+        log.Error("ARI:setupDualTranslator", "error", "MissingChannels")
+        return
+    }
+
+    // Build C→A bridge
+    bridgeCA, err := ensureBridge(nil, c.ctx, c.ariClient, custChan.Key())
+    if err != nil {
+        log.Error("ARI:setupDualTranslator", "error", err)
+        return
+    }
+    call.bridgeCA = bridgeCA
+    // Snoop customer (spy only) and agent (whisper out)
+    custSpyID := custChan.ID() + "-c2a-spy"
+    custSpy, err := custChan.Snoop(custSpyID, &ari.SnoopOptions{App: ariApp, Spy: "in"})
+    if err != nil { log.Error("ARI:setupDualTranslator", "custSpyErr", err); return }
+    call.custSpyCA = custSpy
+    agentWhisperID := agentChan.ID() + "-c2a-whisper"
+    agentWhisper, err := agentChan.Snoop(agentWhisperID, &ari.SnoopOptions{App: ariApp, Whisper: "out"})
+    if err != nil { log.Error("ARI:setupDualTranslator", "agentWhisperErr", err); return }
+    call.agentWhisperCA = agentWhisper
+    if err := bridgeCA.AddChannel(custSpy.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addCustSpy", err); return }
+    if err := bridgeCA.AddChannel(agentWhisper.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addAgentWhisper", err); return }
+
+    // External media for C→A
+    caPort, ok := c.getPort(); if !ok { log.Error("ARI:setupDualTranslator", "error", "NoPortCA"); return }
+    caURL := HOST_ADD + ":" + strconv.Itoa(caPort)
+    extCAID := call.getID() + "-c2a-ext"
+    extCA, err := custChan.ExternalMedia(ari.ExternalMediaOptions{App: ariApp, ExternalHost: caURL, ChannelID: extCAID, Format: FORMAT()})
+    if err != nil { log.Error("ARI:setupDualTranslator", "extCAErr", err); c.releasePort(caPort); return }
+    call.extCA = extCA
+    if err := bridgeCA.AddChannel(extCA.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addExtCA", err); return }
+
+    // Build A→C bridge
+    bridgeAC, err := ensureBridge(nil, c.ctx, c.ariClient, agentChan.Key())
+    if err != nil { log.Error("ARI:setupDualTranslator", "error", err); return }
+    call.bridgeAC = bridgeAC
+    // Snoop agent (spy only) and customer (whisper out); also add agent whisper so agent hears english too
+    agentSpyID := agentChan.ID() + "-a2c-spy"
+    agentSpy, err := agentChan.Snoop(agentSpyID, &ari.SnoopOptions{App: ariApp, Spy: "in"})
+    if err != nil { log.Error("ARI:setupDualTranslator", "agentSpyErr", err); return }
+    call.agentSpyAC = agentSpy
+    custWhisperID := custChan.ID() + "-a2c-whisper"
+    custWhisper, err := custChan.Snoop(custWhisperID, &ari.SnoopOptions{App: ariApp, Whisper: "out"})
+    if err != nil { log.Error("ARI:setupDualTranslator", "custWhisperErr", err); return }
+    call.custWhisperAC = custWhisper
+    if err := bridgeAC.AddChannel(agentSpy.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addAgentSpy", err); return }
+    if err := bridgeAC.AddChannel(custWhisper.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addCustWhisper", err); return }
+    // Also let agent hear translated english
+    if err := bridgeAC.AddChannel(agentChan.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addAgentChanHear", err) }
+
+    // External media for A→C
+    acPort, ok := c.getPort(); if !ok { log.Error("ARI:setupDualTranslator", "error", "NoPortAC"); return }
+    acURL := HOST_ADD + ":" + strconv.Itoa(acPort)
+    extACID := call.getID() + "-a2c-ext"
+    extAC, err := agentChan.ExternalMedia(ari.ExternalMediaOptions{App: ariApp, ExternalHost: acURL, ChannelID: extACID, Format: FORMAT()})
+    if err != nil { log.Error("ARI:setupDualTranslator", "extACErr", err); c.releasePort(acPort); return }
+    call.extAC = extAC
+    if err := bridgeAC.AddChannel(extAC.Key().ID); err != nil { log.Error("ARI:setupDualTranslator", "addExtAC", err); return }
+
+    // Notify voicebot via external event with JSON payload
+    payload := map[string]interface{}{
+        "event": "translator_ready",
+        "c2a": map[string]interface{}{
+            "host": HOST_ADD,
+            "port": caPort,
+            "ari_addr": AST_ADD,
+        },
+        "a2c": map[string]interface{}{
+            "host": HOST_ADD,
+            "port": acPort,
+            "ari_addr": AST_ADD,
+        },
+    }
+    b, _ := json.Marshal(payload)
+    c.eventURICallfunc(call.getInfo(), string(b), "translator")
+}
+
 // Connector interface methods
 func (c *Connector) Connect() bool {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -610,10 +797,14 @@ func (c *Connector) Connect() bool {
 	}
 
 	c.ariClient = ac
-	sub := c.ariClient.Bus().Subscribe(nil, "StasisStart")
+    sub := c.ariClient.Bus().Subscribe(nil, "StasisStart")
 	log.Info("ARI:Connect", "Status", "Connected to ARI")
 
-	ever := true
+    // Start AMI watcher if credentials provided
+    if c.amiUser != "" && c.amiPass != "" {
+        go c.watchAMI()
+    }
+    ever := true
 	for ever {
 		select {
 		case e := <-sub.Events():
@@ -629,7 +820,11 @@ func (c *Connector) Connect() bool {
 
 			dialkey := v.Channel.Dialplan.Exten + "@" + v.Channel.Dialplan.Context
 			log.Info("ARI:Connect", "DialKey", dialkey)
-			if dialkey == "8888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
+            agentExt := os.Getenv("TRANSLATOR_AGENT_EXT")
+            if agentExt == "" {
+                agentExt = "1100"
+            }
+            if dialkey == "8888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" || strings.HasPrefix(dialkey, agentExt+"@") {
 				log.Info("ARI:Connect", "DialKey", "Matched")
 				go handleNewCall(c, c.ariClient.Channel().Get(v.Key(ari.ChannelKey, v.Channel.ID)))
 			} else if chanIDSuffix == "call" {
@@ -650,6 +845,11 @@ func (c *Connector) Connect() bool {
 					return false
 				} else {
 					log.Info("ARI:Connect", "Status", "Channel added to bridge", "ChannelID", chanID)
+                    // After agent leg joins, setup dual translator topology if enabled
+                    if os.Getenv("TRANSLATOR_DUAL_TOPOLOGY") == "true" {
+                        agentChan := c.ariClient.Channel().Get(v.Key(ari.ChannelKey, chanID))
+                        go c.setupDualTranslator(call, agentChan)
+                    }
 				}
 			}
 

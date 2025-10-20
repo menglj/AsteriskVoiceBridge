@@ -66,3 +66,23 @@ This application contains a folder [dockerfiles](./dockerfiles/) with two script
 This project is licensed under the **GNU Affero General Public License (AGPL)**.
 
 See [LICENSE](./LICENSE) for details.
+
+## AI Translator (Dual Topology)
+
+- Set env:
+  - `TRANSLATOR_DUAL_TOPOLOGY=true`
+  - `TRANSLATOR_AGENT_EXT=1100`
+  - `USE_GOOGLE_STT_TTS=true`
+  - `CUSTOMER_STT_LANG=en-US`
+  - `AGENT_STT_LANG=cmn-CN`
+  - `CUSTOMER_TO_AGENT_TRANSLATE=en-US->zh-CN`
+  - `AGENT_TO_CUSTOMER_TRANSLATE=zh-CN->en-US`
+  - `GOOGLE_APPLICATION_CREDENTIALS=/path/creds.json`
+  - proxy env as needed (`http_proxy`, `https_proxy`)
+
+- Dial: customer extension calls 1100; when agent answers, ARI builds dual bridges and translation starts automatically.
+
+- Notes:
+  - STT is paused during TTS playback with interrupt detection enabled.
+  - Both directions run as sub-sessions: `<callid>-c2a` and `<callid>-a2c`.
+  - On hangup, sub-sessions and RTP proxies are cleaned up.

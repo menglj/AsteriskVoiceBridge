@@ -381,7 +381,12 @@ type VoiceBot struct {
 	googleSTTProvider *google.GoogleSTTProvider
 
 	remoteCommander   *rclocal.StudioCommander     //RC
-	translateProvider *google.GoogleTranslateProvider // Translation provider
+    translateProvider *google.GoogleTranslateProvider // Legacy single provider
+    // Dual-direction providers
+    translateC2A *google.GoogleTranslateProvider
+    translateA2C *google.GoogleTranslateProvider
+    // Dual topology RTP proxies per callid
+    subProxies map[string]struct{ C2A *vproxy.IOProxy; A2C *vproxy.IOProxy }
 }
 
 func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage string) (*VoiceBot, bool) {
@@ -389,7 +394,8 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 	vb := VoiceBot{commandWord: commandWord, defaultmode: defaultmode, defaultlanguage: defaultlanguage}
 	vb.initializeCommands()
 
-	vb.callMap = make(map[string]*voicebotCall)
+    vb.callMap = make(map[string]*voicebotCall)
+    vb.subProxies = make(map[string]struct{ C2A *vproxy.IOProxy; A2C *vproxy.IOProxy })
 
 	http_url := "http://" + ariman.AST_ADD + ":8088/ari"
 	ws_url := "ws://" + ariman.AST_ADD + ":8088/ari/events"
@@ -447,16 +453,43 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 		}
 	}
 
-	// Create Google Translate provider
-	translateProvider, ok := google.NewGoogleTranslateProvider()
-	if ok {
-		vb.translateProvider = translateProvider
-		// Set translation callback
-		vb.translateProvider.SetTranslationCallback(vb.HandleTranslationResults)
-	} else {
-		log.Error("Failed to create Google Translate provider")
-		return nil, false
-	}
+    // Create dual Google Translate providers (customer->agent and agent->customer)
+    // Fallback to single provider if explicit pair not set
+    c2aPair := os.Getenv("CUSTOMER_TO_AGENT_TRANSLATE")
+    if c2aPair == "" {
+        c2aPair = "en-US->zh-CN"
+    }
+    a2cPair := os.Getenv("AGENT_TO_CUSTOMER_TRANSLATE")
+    if a2cPair == "" {
+        a2cPair = "zh-CN->en-US"
+    }
+
+    parsePair := func(s string) (string, string) {
+        parts := strings.Split(s, "->")
+        if len(parts) != 2 {
+            return "en-US", "zh-CN"
+        }
+        return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+    }
+
+    c2aSrc, c2aDst := parsePair(c2aPair)
+    a2cSrc, a2cDst := parsePair(a2cPair)
+
+    c2aProvider, ok := google.NewGoogleTranslateProviderWith(c2aSrc, c2aDst)
+    if !ok {
+        log.Error("Failed to create Google Translate C2A provider")
+        return nil, false
+    }
+    c2aProvider.SetTranslationCallback(vb.HandleTranslationResults)
+    vb.translateC2A = c2aProvider
+
+    a2cProvider, ok := google.NewGoogleTranslateProviderWith(a2cSrc, a2cDst)
+    if !ok {
+        log.Error("Failed to create Google Translate A2C provider")
+        return nil, false
+    }
+    a2cProvider.SetTranslationCallback(vb.HandleTranslationResults)
+    vb.translateA2C = a2cProvider
 
 	// set the callbacks once we have created all providers
 	vb.ariController.SetCallbacks(vb)
@@ -719,13 +752,13 @@ func (v VoiceBot) HandleNewCall(ci ariman.CallInfo) bool {
 	log.Info("BOT:HandleNewCall", "dest_media_address", ci.DestMediaAddress)
 	log.Info("BOT:HandleNewCall", "dest_media_port", strconv.Itoa(ci.DestMediaPort))
 
-	vbcall, ok := newVoiceBotCall(ci, v.commandWord)
+    vbcall, ok := newVoiceBotCall(ci, v.commandWord)
 	if !ok {
 		return ok
 	}
 	vbcall.setLocalListen(true)
 
-	udpProxy, ok := vproxy.CreateRTPPProxy(ci.DestMediaAddress, ci.DestMediaPort, ci.SrcMediaAddress, ci.SrcMediaPort)
+    udpProxy, ok := vproxy.CreateRTPPProxy(ci.DestMediaAddress, ci.DestMediaPort, ci.SrcMediaAddress, ci.SrcMediaPort)
 	if !ok {
 		return ok
 	}
@@ -738,38 +771,95 @@ func (v VoiceBot) HandleNewCall(ci ariman.CallInfo) bool {
 	// Check which STT/TTS provider to use
 	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
 
-	if OPMODE == "text" {
-		if useGoogle {
-			ok = v.googleSTTProvider.NewCall(vbcall.getID(), v.defaultmode, v.defaultlanguage, v.commandWord, udpProxy)
-		} else {
-			ok = v.sttprovider.NewCall(vbcall.getID(), v.defaultmode, v.defaultlanguage, v.commandWord, udpProxy)
-		}
-		if !ok {
-			v.removeCall(vbcall.getID())
-			udpProxy.Stop()
-			return ok
-		}
-	}
+    // Prepare sub-session IDs for dual-direction translation
+    c2aID := vbcall.getID() + "-c2a"
+    a2cID := vbcall.getID() + "-a2c"
 
-	if OPMODE == "text" || OPMODE == "hybrid" {
-		if useGoogle {
-			ok = v.googleTTSProvider.NewCall(vbcall.getID(), udpProxy)
-		} else {
-			ok = v.ttsprovider.NewCall(vbcall.getID(), udpProxy)
-		}
-		if !ok {
-			if OPMODE == "text" {
-				if useGoogle {
-					v.googleSTTProvider.EndCall(vbcall.getID())
-				} else {
-					v.sttprovider.EndCall(vbcall.getID())
-				}
-			}
-			v.removeCall(vbcall.getID())
-			udpProxy.Stop()
-			return ok
-		}
-	}
+    customerSTTLang := os.Getenv("CUSTOMER_STT_LANG")
+    if customerSTTLang == "" {
+        customerSTTLang = "en-US"
+    }
+    agentSTTLang := os.Getenv("AGENT_STT_LANG")
+    if agentSTTLang == "" {
+        agentSTTLang = "cmn-CN"
+    }
+
+    // If dual topology is enabled, defer sub-session creation until we receive translator_ready event
+    if os.Getenv("TRANSLATOR_DUAL_TOPOLOGY") == "true" {
+        log.Info("BOT:HandleNewCall", "callid", vbcall.getID(), "status", "DualTopologyEnabled-DeferSubSessions")
+        // still register the call and keep proxy for backward compatibility tasks
+    } else if OPMODE == "text" {
+        if useGoogle {
+            // Create two STT sub-sessions on the same RTP proxy for now
+            if ok = v.googleSTTProvider.NewCall(c2aID, v.defaultmode, customerSTTLang, v.commandWord, udpProxy); !ok {
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+            if ok = v.googleSTTProvider.NewCall(a2cID, v.defaultmode, agentSTTLang, v.commandWord, udpProxy); !ok {
+                v.googleSTTProvider.EndCall(c2aID)
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+        } else {
+            if ok = v.sttprovider.NewCall(c2aID, v.defaultmode, customerSTTLang, v.commandWord, udpProxy); !ok {
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+            if ok = v.sttprovider.NewCall(a2cID, v.defaultmode, agentSTTLang, v.commandWord, udpProxy); !ok {
+                v.sttprovider.EndCall(c2aID)
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+        }
+    }
+
+    if os.Getenv("TRANSLATOR_DUAL_TOPOLOGY") == "true" {
+        // Defer
+    } else if OPMODE == "text" || OPMODE == "hybrid" {
+        if useGoogle {
+            if ok = v.googleTTSProvider.NewCall(c2aID, udpProxy); !ok {
+                if OPMODE == "text" {
+                    v.googleSTTProvider.EndCall(c2aID)
+                    v.googleSTTProvider.EndCall(a2cID)
+                }
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+            if ok = v.googleTTSProvider.NewCall(a2cID, udpProxy); !ok {
+                if OPMODE == "text" {
+                    v.googleSTTProvider.EndCall(c2aID)
+                    v.googleSTTProvider.EndCall(a2cID)
+                }
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+        } else {
+            if ok = v.ttsprovider.NewCall(c2aID, udpProxy); !ok {
+                if OPMODE == "text" {
+                    v.sttprovider.EndCall(c2aID)
+                    v.sttprovider.EndCall(a2cID)
+                }
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+            if ok = v.ttsprovider.NewCall(a2cID, udpProxy); !ok {
+                if OPMODE == "text" {
+                    v.sttprovider.EndCall(c2aID)
+                    v.sttprovider.EndCall(a2cID)
+                }
+                v.removeCall(vbcall.getID())
+                udpProxy.Stop()
+                return ok
+            }
+        }
+    }
 
 	// Translation doesn't need dialog creation - it's always ready
 
@@ -823,8 +913,44 @@ func (v VoiceBot) EndCall(callid string) bool {
 	log.Info("BOT:EndCall", "callid", callid)
 	call, ok := v.getCall(callid)
 	if ok {
+        // End dual sub-sessions before stopping proxy
+        c2aID := callid + "-c2a"
+        a2cID := callid + "-a2c"
+        useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+        if OPMODE == "text" {
+            if useGoogle {
+                if v.googleSTTProvider != nil {
+                    v.googleSTTProvider.EndCall(c2aID)
+                    v.googleSTTProvider.EndCall(a2cID)
+                }
+            } else {
+                if v.sttprovider != nil {
+                    v.sttprovider.EndCall(c2aID)
+                    v.sttprovider.EndCall(a2cID)
+                }
+            }
+        }
+        if OPMODE == "text" || OPMODE == "hybrid" {
+            if useGoogle {
+                if v.googleTTSProvider != nil {
+                    v.googleTTSProvider.EndCall(c2aID)
+                    v.googleTTSProvider.EndCall(a2cID)
+                }
+            } else {
+                if v.ttsprovider != nil {
+                    v.ttsprovider.EndCall(c2aID)
+                    v.ttsprovider.EndCall(a2cID)
+                }
+            }
+        }
 		log.Info("BOT:EndCall", "callid", callid, "status", "Stopping RTP Proxy")
 		call.getUDPProxy().Stop()
+        // Stop dual proxies if present
+        if sp, exists := v.subProxies[callid]; exists {
+            if sp.C2A != nil { sp.C2A.Stop() }
+            if sp.A2C != nil { sp.A2C.Stop() }
+            delete(v.subProxies, callid)
+        }
 	} else {
 		log.Info("BOT:EndCall", "callid", callid, "status", "Call not found")
 	}
@@ -839,8 +965,49 @@ func (v VoiceBot) HandleCallEvent(ci ariman.CallInfo, event string) bool {
 }
 
 func (v VoiceBot) HandleExternalEvent(ci ariman.CallInfo, event string, tag string) bool {
-	log.Info("BOT:HandleExternalEvent", "callid", ci.CallID, "event", event, "tag", tag)
-	return true
+    log.Info("BOT:HandleExternalEvent", "callid", ci.CallID, "event", event, "tag", tag)
+    if tag == "translator" && os.Getenv("TRANSLATOR_DUAL_TOPOLOGY") == "true" {
+        // event is expected to be JSON with c2a/a2c host/port
+        type proxyInfo struct{ Host string `json:"host"`; Port int `json:"port"` }
+        type payload struct{ Event string `json:"event"`; C2A proxyInfo `json:"c2a"`; A2C proxyInfo `json:"a2c"` }
+        var p payload
+        if err := json.Unmarshal([]byte(event), &p); err != nil {
+            log.Error("BOT:HandleExternalEvent", "callid", ci.CallID, "error", "InvalidPayload")
+            return false
+        }
+        // Build two IOProxy from app(host/port) to asterisk (dest from CallInfo)
+        // c2a
+        proxyCA, ok := vproxy.CreateRTPPProxy(ci.DestMediaAddress, ci.DestMediaPort, p.C2A.Host, p.C2A.Port)
+        if !ok { log.Error("BOT:HandleExternalEvent", "callid", ci.CallID, "error", "CreateProxyCAFailed"); return false }
+        // a2c
+        proxyAC, ok := vproxy.CreateRTPPProxy(ci.DestMediaAddress, ci.DestMediaPort, p.A2C.Host, p.A2C.Port)
+        if !ok { log.Error("BOT:HandleExternalEvent", "callid", ci.CallID, "error", "CreateProxyACFailed"); return false }
+
+        // Create sub-sessions bound to dedicated proxies
+        c2aID := ci.CallID + "-c2a"
+        a2cID := ci.CallID + "-a2c"
+        useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+        customerSTTLang := os.Getenv("CUSTOMER_STT_LANG"); if customerSTTLang == "" { customerSTTLang = "en-US" }
+        agentSTTLang := os.Getenv("AGENT_STT_LANG"); if agentSTTLang == "" { agentSTTLang = "cmn-CN" }
+
+        if useGoogle {
+            if ok = v.googleSTTProvider.NewCall(c2aID, v.defaultmode, customerSTTLang, v.commandWord, proxyCA); !ok { return false }
+            if ok = v.googleSTTProvider.NewCall(a2cID, v.defaultmode, agentSTTLang, v.commandWord, proxyAC); !ok { v.googleSTTProvider.EndCall(c2aID); return false }
+            if ok = v.googleTTSProvider.NewCall(c2aID, proxyCA); !ok { v.googleSTTProvider.EndCall(c2aID); v.googleSTTProvider.EndCall(a2cID); return false }
+            if ok = v.googleTTSProvider.NewCall(a2cID, proxyAC); !ok { v.googleSTTProvider.EndCall(c2aID); v.googleSTTProvider.EndCall(a2cID); v.googleTTSProvider.EndCall(c2aID); return false }
+        } else {
+            if ok = v.sttprovider.NewCall(c2aID, v.defaultmode, customerSTTLang, v.commandWord, proxyCA); !ok { return false }
+            if ok = v.sttprovider.NewCall(a2cID, v.defaultmode, agentSTTLang, v.commandWord, proxyAC); !ok { v.sttprovider.EndCall(c2aID); return false }
+            if ok = v.ttsprovider.NewCall(c2aID, proxyCA); !ok { v.sttprovider.EndCall(c2aID); v.sttprovider.EndCall(a2cID); return false }
+            if ok = v.ttsprovider.NewCall(a2cID, proxyAC); !ok { v.sttprovider.EndCall(c2aID); v.sttprovider.EndCall(a2cID); v.ttsprovider.EndCall(c2aID); return false }
+        }
+
+        // Store proxies for cleanup
+        v.subProxies[ci.CallID] = struct{ C2A *vproxy.IOProxy; A2C *vproxy.IOProxy }{ C2A: proxyCA, A2C: proxyAC }
+        log.Info("BOT:HandleExternalEvent", "callid", ci.CallID, "status", "TranslatorReady")
+        return true
+    }
+    return true
 }
 
 func (v VoiceBot) HandleDtmfEvent(ci ariman.CallInfo, dtmf string) bool {
@@ -992,8 +1159,8 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 		return ok
 	}
 
-	if level != "passive" {
-		if level == "conversationalai-vad-start" {
+    if level != "passive" {
+        if level == "conversationalai-vad-start" {
 			// Cancel any ongoing TTS
 			useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
 			if useGoogle {
@@ -1003,7 +1170,7 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 			} else {
 				v.ttsprovider.CancelText(callid)
 			}
-		} else if level == "interrupt" {
+        } else if level == "interrupt" {
 			// Handle interrupt during TTS playback
 			log.Info("BOT:HandleTranscriptResults", "callid", callid, "status", "InterruptDetected", "text", text)
 			
@@ -1024,17 +1191,33 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 				}
 			}
 			
-			// Process the interrupt text as normal translation
-			if v.translateProvider != nil {
-				v.translateProvider.TranslateText(callid, text)
-			}
+            // Process the interrupt text as normal translation on the correct direction
+            if strings.HasSuffix(callid, "-c2a") {
+                if v.translateC2A != nil {
+                    v.translateC2A.TranslateText(callid, text)
+                }
+            } else if strings.HasSuffix(callid, "-a2c") {
+                if v.translateA2C != nil {
+                    v.translateA2C.TranslateText(callid, text)
+                }
+            }
 		} else {
-			// Translate the text and send to TTS
-			if v.translateProvider != nil {
-				v.translateProvider.TranslateText(callid, text)
-			} else {
-				log.Error("BOT:HandleTranscriptResults", "callid", callid, "error", "Translation provider not available")
-			}
+            // Translate the text on the correct direction and send to TTS
+            if strings.HasSuffix(callid, "-c2a") {
+                if v.translateC2A != nil {
+                    v.translateC2A.TranslateText(callid, text)
+                } else {
+                    log.Error("BOT:HandleTranscriptResults", "callid", callid, "error", "C2A translation provider not available")
+                }
+            } else if strings.HasSuffix(callid, "-a2c") {
+                if v.translateA2C != nil {
+                    v.translateA2C.TranslateText(callid, text)
+                } else {
+                    log.Error("BOT:HandleTranscriptResults", "callid", callid, "error", "A2C translation provider not available")
+                }
+            } else {
+                log.Error("BOT:HandleTranscriptResults", "callid", callid, "error", "Unknown sub-session suffix")
+            }
 		}
 	}
 
@@ -1055,25 +1238,25 @@ func (v VoiceBot) HandleTranslationResults(callid string, translatedText string,
 		return false
 	}
 
-	// Pause STT during TTS playback to enable interrupt detection
-	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
-	if useGoogle {
-		if v.googleSTTProvider != nil {
-			v.googleSTTProvider.PauseCall(callid)
-		}
-	}
-	
-	// Send translated text to TTS
-	if useGoogle {
-		if v.googleTTSProvider != nil {
-			v.googleTTSProvider.AddText(callid, translatedText, "translation", targetLanguage)
-		} else {
-			log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Google TTS provider not available")
-			return false
-		}
-	} else {
-		v.ttsprovider.AddText(callid, translatedText, "translation", targetLanguage)
-	}
+    // Pause STT during TTS playback to enable interrupt detection
+    useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+    if useGoogle {
+        if v.googleSTTProvider != nil {
+            v.googleSTTProvider.PauseCall(callid)
+        }
+    }
+
+    // Send translated text to TTS for the corresponding sub-session
+    if useGoogle {
+        if v.googleTTSProvider != nil {
+            v.googleTTSProvider.AddText(callid, translatedText, "translation", targetLanguage)
+        } else {
+            log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Google TTS provider not available")
+            return false
+        }
+    } else {
+        v.ttsprovider.AddText(callid, translatedText, "translation", targetLanguage)
+    }
 
 	return true
 }

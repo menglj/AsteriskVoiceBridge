@@ -64,6 +64,86 @@ func NewGoogleTranslateProvider() (*GoogleTranslateProvider, bool) {
 	return provider, true
 }
 
+// NewGoogleTranslateProviderWith creates a provider with explicit source/target
+func NewGoogleTranslateProviderWith(sourceLang, targetLang string) (*GoogleTranslateProvider, bool) {
+    ctx := context.Background()
+
+    client, err := translate.NewClient(ctx)
+    if err != nil {
+        log.Error("Failed to create Google Translate client", "error", err)
+        return nil, false
+    }
+
+    if sourceLang == "" {
+        sourceLang = "en-US"
+    }
+    if targetLang == "" {
+        targetLang = "zh-CN"
+    }
+
+    provider := &GoogleTranslateProvider{
+        client:         client,
+        sourceLanguage: sourceLang,
+        targetLanguage: targetLang,
+    }
+
+    log.Info("Google Translate provider created (explicit)",
+        "source_language", sourceLang,
+        "target_language", targetLang)
+
+    return provider, true
+}
+
+// TranslateTextWith translates text with explicit source/target without changing defaults
+func (g *GoogleTranslateProvider) TranslateTextWith(callid string, text string, sourceLang string, targetLang string) bool {
+    if text == "" {
+        return true
+    }
+    text = strings.TrimSpace(text)
+    if text == "" {
+        return true
+    }
+
+    if sourceLang == "" {
+        sourceLang = g.sourceLanguage
+    }
+    if targetLang == "" {
+        targetLang = g.targetLanguage
+    }
+
+    ctx := context.Background()
+
+    sourceTag, err := language.Parse(sourceLang)
+    if err != nil {
+        log.Error("Invalid source language", "language", sourceLang, "error", err)
+        return false
+    }
+    targetTag, err := language.Parse(targetLang)
+    if err != nil {
+        log.Error("Invalid target language", "language", targetLang, "error", err)
+        return false
+    }
+
+    translations, err := g.client.Translate(ctx, []string{text}, targetTag, &translate.Options{
+        Source: sourceTag,
+        Format: translate.Text,
+    })
+    if err != nil {
+        log.Error("Translation failed", "error", err)
+        return false
+    }
+    if len(translations) == 0 {
+        log.Error("No translation result")
+        return false
+    }
+
+    translatedText := translations[0].Text
+    if g.translationCB != nil {
+        return g.translationCB(callid, translatedText, sourceLang, targetLang)
+    }
+    return true
+}
+
 // SetTranslationCallback sets the callback for translation results
 func (g *GoogleTranslateProvider) SetTranslationCallback(callback TranslationCallback) {
 	g.translationCB = callback
