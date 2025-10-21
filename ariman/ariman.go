@@ -61,6 +61,9 @@ type CallInfo struct {
 	DestMediaAddress string            `json:"dest_media_address"`
 	DestMediaPort    int               `json:"dest_media_port"`
 	Vars             map[string]string `json:"variables"`
+	Domain           string            `json:"domain"`           // 从Stasis参数解析
+	AgentExtension   string            `json:"agent_extension"` // 坐席分机
+	AgentChannel     string            `json:"agent_channel"`    // 坐席通道ID
 }
 
 /**************************** serviceCall ****************************/
@@ -91,6 +94,71 @@ func (sc *serviceCall) setTerminating() {
 
 func (sc *serviceCall) isTerminating() bool {
 	return sc.terminating
+}
+
+func newBotCallWithArgs(bridge *ari.BridgeHandle, internalChannel *ari.ChannelHandle,
+	snoopChannel *ari.ChannelHandle, externalChannel *ari.ChannelHandle, writable bool,
+	dstMediaAddress string, dstMediaPort int,
+	srcMediaAddress string, srcMediaPort int,
+	context context.Context, args []string) (*serviceCall, bool) {
+
+	callinfo := CallInfo{CallID: internalChannel.ID(), AppKey: "voicebotdemo", DestMediaAddress: dstMediaAddress, DestMediaPort: dstMediaPort, SrcMediaAddress: srcMediaAddress, SrcMediaPort: srcMediaPort}
+	callinfo.Vars = make(map[string]string)
+
+	CallerNumber, err := internalChannel.GetVariable("CALLERID(num)")
+	if err != nil {
+		log.Error("ARI:failed to get caller number", "error", err)
+	} else {
+		log.Info("ARI:Callerinfo", "Number", CallerNumber)
+		callinfo.Vars["CALLERIDNUM"] = CallerNumber
+	}
+
+	CallerName, err := internalChannel.GetVariable("CALLERID(name)")
+	if err != nil {
+		log.Error("ARI:failed to get caller number", "error", err)
+	} else {
+		log.Info("ARI:Callerinfo", "Name", CallerName)
+		callinfo.Vars["CALLERIDNAME"] = CallerName
+	}
+
+	Extension, err := internalChannel.GetVariable("EXTEN")
+	if err != nil {
+		log.Error("ARI:failed to get extension", "error", err)
+	} else {
+		log.Info("ARI:Callerinfo", "Extension", Extension)
+		callinfo.Vars["EXTEN"] = Extension
+	}
+
+	Context, err := internalChannel.GetVariable("CONTEXT")
+	if err != nil {
+		log.Error("ARI:failed to get context", "error", err)
+	} else {
+		log.Info("ARI:Callerinfo", "Context", Context)
+		callinfo.Vars["CONTEXT"] = Context
+	}
+
+	// Parse Stasis arguments from args slice
+	if len(args) >= 1 {
+		callinfo.Domain = args[0]
+		callinfo.Vars["ARG1"] = args[0]
+		log.Info("ARI:StasisArgs", "ARG1", args[0])
+	}
+	if len(args) >= 2 {
+		callinfo.AgentExtension = args[1]
+		callinfo.Vars["ARG2"] = args[1]
+		log.Info("ARI:StasisArgs", "ARG2", args[1])
+	}
+
+	call := &serviceCall{info: callinfo,
+		botBridge:       bridge,
+		internalChannel: internalChannel,
+		snoopChannel:    snoopChannel,
+		externalChannel: externalChannel,
+		writable:        writable,
+		CTX:             context,
+	}
+	call.initialize()
+	return call, true
 }
 
 func newBotCall(bridge *ari.BridgeHandle, internalChannel *ari.ChannelHandle,
@@ -132,6 +200,25 @@ func newBotCall(bridge *ari.BridgeHandle, internalChannel *ari.ChannelHandle,
 	} else {
 		log.Info("ARI:Callerinfo", "Context", Context)
 		callinfo.Vars["CONTEXT"] = Context
+	}
+
+	// Parse Stasis arguments (ARG1=domain, ARG2=agent_extension)
+	ARG1, err := internalChannel.GetVariable("ARG1")
+	if err != nil {
+		log.Error("ARI:failed to get ARG1", "error", err)
+	} else {
+		log.Info("ARI:StasisArgs", "ARG1", ARG1)
+		callinfo.Domain = ARG1
+		callinfo.Vars["ARG1"] = ARG1
+	}
+
+	ARG2, err := internalChannel.GetVariable("ARG2")
+	if err != nil {
+		log.Error("ARI:failed to get ARG2", "error", err)
+	} else {
+		log.Info("ARI:StasisArgs", "ARG2", ARG2)
+		callinfo.AgentExtension = ARG2
+		callinfo.Vars["ARG2"] = ARG2
 	}
 
 	call := &serviceCall{info: callinfo,
@@ -467,6 +554,126 @@ func manageExternalChannelSubscriptions(conn *Connector, c *ari.ChannelHandle, t
 	}
 }
 
+func handleNewCallWithArgs(c *Connector, userChannel *ari.ChannelHandle, args []string) bool {
+	// assume we are able to determine the Asterisk side external media address and port
+	var writable bool = true
+	log.Info("ARI:handleNewCallWithArgs", "UserChan", userChannel.ID(), "args", args)
+
+	// Create a snoop channel based on the user channel
+	snoopid := userChannel.ID() + "-snoop"
+    // Spy on caller's outgoing audio for STT, and whisper to caller for TTS playback
+    snoopopts := &ari.SnoopOptions{App: ariApp, Spy: "out", Whisper: "out"}
+	snoopChannel, err := userChannel.Snoop(snoopid, snoopopts)
+	if err != nil {
+		log.Error("ARI:failed to snoop channel", "error", err)
+		return false
+	}
+	log.Info("ARI:handleNewCallWithArgs", "SnoopChan", snoopChannel.ID())
+
+	// Find a free port from our range for the Application side of the external media
+	freePort, ok := c.getPort()
+	if !ok {
+		log.Error("ARI:failed to get free port")
+		return false
+	}
+
+	// Create an external media channel based on the user channel
+	mediaurl := HOST_ADD + ":" + strconv.Itoa(freePort)
+	extid := userChannel.ID() + "-external"
+	log.Info("ARI:handleNewCallWithArgs", "MediaFormat", FORMAT())
+	log.Info("ARI:handleNewCallWithArgs", "ExternalHost", mediaurl)
+	extopts := ari.ExternalMediaOptions{App: ariApp, ExternalHost: mediaurl, ChannelID: extid, Format: FORMAT()}
+
+	externalChannel, err := userChannel.ExternalMedia(extopts)
+	if err != nil {
+		log.Error("ARI:failed to create external channel", "error", err)
+		c.releasePort(freePort)
+		return false
+	}
+
+	// Get the remote RTP address and port from the external channel
+	astPortString, err := externalChannel.GetVariable("UNICASTRTP_LOCAL_PORT")
+	if err != nil {
+		log.Error("ARI:failed to get remote rtp port", "error", err)
+		writable = false
+	}
+	astPort, err := strconv.Atoi(astPortString)
+	if err != nil {
+		log.Error("ARI:failed to get remote rtp port", "error", err)
+		writable = false
+	}
+	log.Info("ARI:handleNewCallWithArgs", "RemoteRTPport", astPort)
+
+	astAdd, err := externalChannel.GetVariable("UNICASTRTP_LOCAL_ADDRESS")
+	if err != nil {
+		log.Error("ARI:failed to get remote rtp address", "error", err)
+		writable = false
+	}
+	log.Info("ARI:handleNewCallWithArgs", "RemoteRTPaddress", astAdd)
+
+	// Create a bridge for service side of the call
+	botBridge, err := ensureBridge(nil, c.ctx, c.ariClient, snoopChannel.Key())
+	if err != nil {
+		log.Error("ARI:failed to create service bridge", "error", err)
+		c.releasePort(freePort)
+		return false
+	}
+
+	// Add the snooping channel to the bridge
+	if err := botBridge.AddChannel(snoopChannel.Key().ID); err != nil {
+		log.Error("ARI:failed to add snoop channel to bridge", "error", err)
+		c.releasePort(freePort)
+		return false
+	}
+
+	// Add the external media channel to the bridge
+	if err := botBridge.AddChannel(externalChannel.Key().ID); err != nil {
+		log.Error("ARI:failed to add external channel to bridge", "error", err)
+		c.releasePort(freePort)
+		return false
+	}
+
+	// If we are not able to get the remote RTP address and port, we will not be able to write audio to the user channel
+	// In that case set some defaults
+	if !writable {
+		astAdd = AST_ADD
+		astPort = 0
+	}
+
+	// Create a new call with Stasis arguments
+	bc, ok := newBotCallWithArgs(botBridge, userChannel, snoopChannel, externalChannel, writable, HOST_ADD, freePort, astAdd, astPort, c.ctx, args)
+	if !ok {
+		log.Error("ARI:Failed to create new call")
+		c.releasePort(freePort)
+		return false
+	}
+
+	// Add the call to the Connector
+	ok = c.addCall(bc)
+	if !ok {
+		log.Error("ARI:Failed to add call or call already added to Connector")
+		c.releasePort(freePort)
+		return false
+	}
+
+	// Subscribe to the new call's user channel events
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go manageUserChannelSubscriptions(c, userChannel, wg)
+	bc.startSilenceIfEmpty()
+
+	// Call back to creator's new call hander
+	ok = c.newCallfunc(bc.getInfo())
+	if !ok {
+		log.Error("ARI:Failed to add call to Connector, terminating!")
+		c.terminateCall(userChannel.ID(), true)
+		c.removeCall(userChannel.ID())
+		return false
+	}
+
+	return true
+}
+
 func handleNewCall(c *Connector, userChannel *ari.ChannelHandle) bool {
 
 	// assume we are able to determine the Asterisk side external media address and port
@@ -620,6 +827,7 @@ func (c *Connector) Connect() bool {
 
 			v := e.(*ari.StasisStart)
 			log.Info("ARI:Connect", "NewChannelInStasis", v.Channel.ID)
+			log.Info("ARI:Connect", "StasisArgs", "args", v.Args)
 			chanID := v.Channel.ID
 			var chanIDSuffix string
 			rootChanID := strings.Split(chanID, "-")[0]
@@ -631,7 +839,7 @@ func (c *Connector) Connect() bool {
 			log.Info("ARI:Connect", "DialKey", dialkey)
 			if dialkey == "8888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
 				log.Info("ARI:Connect", "DialKey", "Matched")
-				go handleNewCall(c, c.ariClient.Channel().Get(v.Key(ari.ChannelKey, v.Channel.ID)))
+				go handleNewCallWithArgs(c, c.ariClient.Channel().Get(v.Key(ari.ChannelKey, v.Channel.ID)), v.Args)
 			} else if chanIDSuffix == "call" {
 				// hopefully we have a call bridge for this call channel
 				call, ok := c.getCallByID(rootChanID)

@@ -1,0 +1,20 @@
+[from_router]
+exten => 8888,1,NoOp()
+    same => n,Answer()
+    same => n,Playback(silence/1)
+    same => n,Stasis(voicebot,client.meng.astercc.com,1100)
+    same => n,Hangup()
+
+; Example configuration for AI Assistant system
+; When client 1009 dials 8888:
+; 1. Asterisk will answer the call
+; 2. Play 1 second of silence
+; 3. Enter Stasis application with parameters:
+;    - Application: voicebot
+;    - ARG1: client.meng.astercc.com (domain)
+;    - ARG2: 1100 (agent extension)
+; 4. The voicebot will automatically call agent 1100@client.meng.astercc.com
+; 5. Once agent answers, three-way call is established:
+;    - Client ↔ Agent (direct audio)
+;    - Client Snoop → STT → Translation → Redis (client speech recognition)
+;    - Redis → TTS → Client (agent text responses)

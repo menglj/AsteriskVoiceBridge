@@ -9,6 +9,8 @@ require (
 
 replace github.com/asterisk/AsteriskVoiceBridge/voicebot => ./voicebot
 
+replace github.com/asterisk/AsteriskVoiceBridge/redis => ./redis
+
 require (
 	cloud.google.com/go v0.120.0 // indirect
 	cloud.google.com/go/auth v0.16.5 // indirect
@@ -30,14 +32,17 @@ require (
 	github.com/asterisk/AsteriskVoiceBridge/deepgram v0.0.0-20250818215110-ef6eb7a7fe63 // indirect
 	github.com/asterisk/AsteriskVoiceBridge/google v0.0.0-20250818215110-ef6eb7a7fe63 // indirect
 	github.com/asterisk/AsteriskVoiceBridge/rclocal v0.0.0-20250818215110-ef6eb7a7fe63 // indirect
+	github.com/asterisk/AsteriskVoiceBridge/redis v0.0.0-20250815221914-059e40057d51 // indirect
 	github.com/asterisk/AsteriskVoiceBridge/voiceai v0.0.0-20250825161155-ea69f4d01451 // indirect
 	github.com/asterisk/AsteriskVoiceBridge/vproxy v0.0.0-20250825155657-54fe44cc7aa9 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/bytedance/sonic v1.9.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/chenzhuoyu/base64x v0.0.0-20221115062448-fe3a3abad311 // indirect
 	github.com/coder/websocket v1.8.13 // indirect
 	github.com/deepgram/deepgram-go-sdk v1.9.0 // indirect
 	github.com/deepmap/oapi-codegen v1.16.3 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dvonthenen/websocket v1.5.1-dyv.2 // indirect
 	github.com/fatih/color v1.15.0 // indirect
 	github.com/fatih/structs v1.1.0 // indirect
@@ -92,6 +97,7 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/pelletier/go-toml/v2 v2.0.8 // indirect
 	github.com/perimeterx/marshmallow v1.1.5 // indirect
+	github.com/redis/go-redis/v9 v9.3.0 // indirect
 	github.com/rotisserie/eris v0.5.4 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/schollz/closestmatch v2.1.0+incompatible // indirect

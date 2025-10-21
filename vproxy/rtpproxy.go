@@ -138,31 +138,33 @@ func (vudp *IOProxy) initialize() {
 }
 
 func CreateRTPPProxy(dstMediaAddress string, dstMediaPort int,
-	srcMediaAddress string, srcMediaPort int) (*IOProxy, bool) {
+    srcMediaAddress string, srcMediaPort int) (*IOProxy, bool) {
 
-	local, err := net.ResolveIPAddr("ip", srcMediaAddress)
+    // Local should bind to our ExternalMedia host/port (dstMediaAddress:dstMediaPort)
+    // Remote should be Asterisk's RTP address/port (srcMediaAddress:srcMediaPort)
+    local, err := net.ResolveIPAddr("ip", dstMediaAddress)
 	if err != nil {
 		log.Error("RTP:CreateRTPPProxy", "ResolveIPAddr Error", err)
 		return &IOProxy{}, false
 	}
-	remote, err := net.ResolveIPAddr("ip", dstMediaAddress)
+    remote, err := net.ResolveIPAddr("ip", srcMediaAddress)
 	if err != nil {
 		log.Error("RTP:CreateRTPPProxy", "ResolveIPAddr Error", err)
 		return &IOProxy{}, false
 	}
 
-	tpLocal, err := rtp.NewTransportUDP(local, srcMediaPort, "")
+    tpLocal, err := rtp.NewTransportUDP(local, dstMediaPort, "")
 	if err != nil {
 		log.Error("RTP:CreateRTPPProxy", "NewTransportUDP Error", err)
 		return &IOProxy{}, false
 	}
 
 	rsLocal := rtp.NewSession(tpLocal, tpLocal)
-	remoteadd := &rtp.Address{IPAddr: remote.IP, DataPort: dstMediaPort, CtrlPort: dstMediaPort + 1, Zone: ""}
+    remoteadd := &rtp.Address{IPAddr: remote.IP, DataPort: srcMediaPort, CtrlPort: srcMediaPort + 1, Zone: ""}
 	rsLocal.AddRemote(remoteadd)
 
 	ssrcid := generateRandomSSRCID()
-	strLocalIdx, err := rsLocal.NewSsrcStreamOut(&rtp.Address{IPAddr: local.IP, DataPort: srcMediaPort, CtrlPort: srcMediaPort + 1, Zone: ""}, ssrcid, 3200)
+    strLocalIdx, err := rsLocal.NewSsrcStreamOut(&rtp.Address{IPAddr: local.IP, DataPort: dstMediaPort, CtrlPort: dstMediaPort + 1, Zone: ""}, ssrcid, 3200)
 	if err.Error() != "" {
 		log.Error("RTP:CreateRTPPProxy", "NewSsrcStreamOutErr", err.Error())
 	}

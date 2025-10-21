@@ -14,6 +14,7 @@ package voicebot
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"github.com/asterisk/AsteriskVoiceBridge/ariman"
 	"github.com/asterisk/AsteriskVoiceBridge/deepgram"
 	"github.com/asterisk/AsteriskVoiceBridge/google"
+	"github.com/asterisk/AsteriskVoiceBridge/redis"
 	"github.com/asterisk/AsteriskVoiceBridge/rclocal"
 	"github.com/asterisk/AsteriskVoiceBridge/vproxy"
 )
@@ -52,6 +54,9 @@ type voicebotCall struct {
 	listen, ismuted, closing bool
 
 	delayedCommands []chan bool
+	
+	// Cache for STT original text to be used in translation callback
+	lastTranscript string
 }
 
 func (vbc *voicebotCall) initialize() {
@@ -382,6 +387,9 @@ type VoiceBot struct {
 
 	remoteCommander   *rclocal.StudioCommander     //RC
 	translateProvider *google.GoogleTranslateProvider // Translation provider
+	
+	// Redis client for agent communication
+	redisClient *redis.RedisClient
 }
 
 func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage string) (*VoiceBot, bool) {
@@ -447,16 +455,26 @@ func CreateVoiceBot(commandWord string, defaultmode string, defaultlanguage stri
 		}
 	}
 
-	// Create Google Translate provider
-	translateProvider, ok := google.NewGoogleTranslateProvider()
-	if ok {
-		vb.translateProvider = translateProvider
-		// Set translation callback
-		vb.translateProvider.SetTranslationCallback(vb.HandleTranslationResults)
-	} else {
-		log.Error("Failed to create Google Translate provider")
-		return nil, false
-	}
+    // Create Redis client first so it's ready before callbacks are bound
+    redisClient, ok := redis.NewRedisClient()
+    if ok {
+        vb.redisClient = redisClient
+        log.Info("Redis client initialized successfully")
+    } else {
+        log.Error("Failed to create Redis client")
+        return nil, false
+    }
+
+    // Create Google Translate provider (after Redis so callback sees initialized vb)
+    translateProvider, ok := google.NewGoogleTranslateProvider()
+    if ok {
+        vb.translateProvider = translateProvider
+        // Set translation callback
+        vb.translateProvider.SetTranslationCallback(vb.HandleTranslationResults)
+    } else {
+        log.Error("Failed to create Google Translate provider")
+        return nil, false
+    }
 
 	// set the callbacks once we have created all providers
 	vb.ariController.SetCallbacks(vb)
@@ -718,6 +736,8 @@ func (v VoiceBot) HandleNewCall(ci ariman.CallInfo) bool {
 	log.Info("BOT:HandleNewCall", "src_media_port", strconv.Itoa(ci.SrcMediaPort))
 	log.Info("BOT:HandleNewCall", "dest_media_address", ci.DestMediaAddress)
 	log.Info("BOT:HandleNewCall", "dest_media_port", strconv.Itoa(ci.DestMediaPort))
+	log.Info("BOT:HandleNewCall", "domain", ci.Domain)
+	log.Info("BOT:HandleNewCall", "agent_extension", ci.AgentExtension)
 
 	vbcall, ok := newVoiceBotCall(ci, v.commandWord)
 	if !ok {
@@ -734,6 +754,50 @@ func (v VoiceBot) HandleNewCall(ci ariman.CallInfo) bool {
 
 	// Add call to callMap early to avoid race conditions with STT callbacks
 	v.addCall(&vbcall)
+
+	// Auto-call agent if domain and agent extension are provided
+	if ci.Domain != "" && ci.AgentExtension != "" {
+		// Try different URI formats based on configuration
+		var agentURI string
+		uriFormat := os.Getenv("AGENT_URI_FORMAT")
+		pjsipTrunk := os.Getenv("AGENT_PJSIP_TRUNK") // e.g., router01
+		switch uriFormat {
+		case "SIP":
+			agentURI = fmt.Sprintf("SIP/%s@%s", ci.AgentExtension, ci.Domain)
+		case "LOCAL":
+			agentURI = fmt.Sprintf("Local/%s@from_router", ci.AgentExtension)
+		case "PJSIP_LOCAL":
+			agentURI = fmt.Sprintf("PJSIP/%s", ci.AgentExtension)
+		case "PJSIP_TRUNK":
+			// Use PJSIP trunk/proxy: PJSIP/<trunk>/sip:<ext>@<domain>
+			if pjsipTrunk != "" {
+				agentURI = fmt.Sprintf("PJSIP/%s/sip:%s@%s", pjsipTrunk, ci.AgentExtension, ci.Domain)
+			} else {
+				// Fallback to standard PJSIP if trunk not set
+				agentURI = fmt.Sprintf("PJSIP/%s@%s", ci.AgentExtension, ci.Domain)
+			}
+		case "OPENSIPS":
+			// 通过OpenSIPS呼叫: sip:1100@client.meng.astercc.com
+			agentURI = fmt.Sprintf("SIP/%s@%s", ci.AgentExtension, ci.Domain)
+		case "PJSIP_OPENSIPS":
+			// 通过PJSIP呼叫OpenSIPS注册的分机
+			agentURI = fmt.Sprintf("PJSIP/%s@%s", ci.AgentExtension, ci.Domain)
+		default:
+			agentURI = fmt.Sprintf("PJSIP/%s@%s", ci.AgentExtension, ci.Domain)
+		}
+		log.Info("BOT:HandleNewCall", "callid", ci.CallID, "status", "CallingAgent", "uri", agentURI, "format", uriFormat, "trunk", pjsipTrunk)
+		
+		// Call agent
+		ok = v.AddURItoCall(ci.CallID, agentURI)
+		if !ok {
+			log.Error("BOT:HandleNewCall", "callid", ci.CallID, "error", "Failed to call agent")
+			// Continue with normal flow even if agent call fails
+		} else {
+			// Start Redis monitoring for agent responses
+			go v.monitorAgentResponse(ci.CallID, ci.Domain, ci.AgentExtension)
+			log.Info("BOT:HandleNewCall", "callid", ci.CallID, "status", "StartedRedisMonitoring")
+		}
+	}
 
 	// Check which STT/TTS provider to use
 	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
@@ -986,10 +1050,18 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 
 	log.Info("BOT:HandleTranscriptResults", "callid", callid, "text", text, "level", level)
 
-	_, ok := v.getCall(callid)
+	call, ok := v.getCall(callid)
 	if !ok {
 		log.Error("BOT:HandleTranscriptResults", "callid", callid, "error", "Call not found")
 		return ok
+	}
+
+	// Cache the transcript for later use in translation callback
+	if level != "passive" && text != "" {
+		call.lastTranscript = text
+		log.Info("BOT:HandleTranscriptResults", "callid", callid, "status", "CachedTranscript", "text", text, "level", level)
+	} else {
+		log.Info("BOT:HandleTranscriptResults", "callid", callid, "status", "SkippedCaching", "text", text, "level", level, "reason", "passive_or_empty")
 	}
 
 	if level != "passive" {
@@ -1042,40 +1114,59 @@ func (v VoiceBot) HandleTranscriptResults(callid string, text string, level stri
 }
 
 // HandleTranslationResults handles translation results and sends to TTS
-func (v VoiceBot) HandleTranslationResults(callid string, translatedText string, sourceLanguage string, targetLanguage string) bool {
+func (v *VoiceBot) HandleTranslationResults(callid string, translatedText string, sourceLanguage string, targetLanguage string) bool {
 	log.Info("BOT:HandleTranslationResults", 
 		"callid", callid, 
 		"translated", translatedText, 
 		"source", sourceLanguage, 
 		"target", targetLanguage)
 
-	_, ok := v.getCall(callid)
+	call, ok := v.getCall(callid)
 	if !ok {
 		log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Call not found")
 		return false
 	}
 
-	// Pause STT during TTS playback to enable interrupt detection
-	useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
-	if useGoogle {
-		if v.googleSTTProvider != nil {
-			v.googleSTTProvider.PauseCall(callid)
+	// Push client message to Redis before sending TTS
+	if v.redisClient != nil && call.lastTranscript != "" {
+		log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "AttemptingRedisPush", "lastTranscript", call.lastTranscript, "translatedText", translatedText)
+		
+		clientMsg := redis.ClientMessage{
+			OriginalText: call.lastTranscript,
+			Translation:  translatedText,
 		}
-	}
-	
-	// Send translated text to TTS
-	if useGoogle {
-		if v.googleTTSProvider != nil {
-			v.googleTTSProvider.AddText(callid, translatedText, "translation", targetLanguage)
+		
+        // Use agent extension for RECEIVE list as per spec
+        agentExt := call.info.AgentExtension
+        if agentExt == "" {
+            agentExt = "1100"
+        }
+
+        queueKey := fmt.Sprintf("%s:AI:AGENT:%s:RECEIVE:%s:L", call.info.Domain, agentExt, callid)
+        log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "RedisPushDetails", "queueKey", queueKey, "agentExt", agentExt, "domain", call.info.Domain)
+        
+		err := v.redisClient.PushClientMessage(queueKey, clientMsg)
+		if err != nil {
+			log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Failed to push client message", "err", err)
 		} else {
-			log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Google TTS provider not available")
-			return false
+			log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "PushedToRedis", "queue", queueKey)
 		}
+		
+		// Clear cached transcript after use
+		call.lastTranscript = ""
 	} else {
-		v.ttsprovider.AddText(callid, translatedText, "translation", targetLanguage)
+		if v.redisClient == nil {
+			log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "Redis client is nil")
+		}
+		if call.lastTranscript == "" {
+			log.Error("BOT:HandleTranslationResults", "callid", callid, "error", "lastTranscript is empty")
+		}
 	}
 
-	return true
+    // Per current requirement: do NOT auto-play TTS to customer for user's speech translations
+    // Only push to Redis for agent console consumption.
+    log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "SkippedAutoTTSPlayback")
+    return true
 }
 
 // END DeepgramSTTCallBackHandler Interface
@@ -1249,4 +1340,77 @@ func (v VoiceBot) HandlePlaybackComplete(callid string, playbackid string) bool 
 
 func (v VoiceBot) handleChannelHangup(callid string) {
 
+}
+
+// monitorAgentResponse monitors Redis queue for agent responses
+func (v *VoiceBot) monitorAgentResponse(callid, domain, agentExt string) {
+	queueKey := fmt.Sprintf("%s:AI:AGENT:%s:RESPONSE:%s:L", domain, agentExt, callid)
+	log.Info("BOT:monitorAgentResponse", "callid", callid, "queue", queueKey, "status", "Started")
+	
+	for {
+		// BLPOP阻塞读取,超时5秒
+		msg, err := v.redisClient.PopAgentResponse(queueKey, 5*time.Second)
+		if err != nil {
+			if err == redis.ErrTimeout {
+				// 检查通话是否结束
+				if call, ok := v.getCall(callid); !ok || call.isClosing() {
+					log.Info("BOT:monitorAgentResponse", "callid", callid, "status", "CallEnded")
+					return
+				}
+				continue
+			}
+			log.Error("BOT:monitorAgentResponse", "callid", callid, "error", err)
+			return
+		}
+		
+		// 处理坐席回应
+		v.handleAgentResponse(callid, msg)
+	}
+}
+
+// handleAgentResponse processes agent responses from Redis
+func (v *VoiceBot) handleAgentResponse(callid string, resp *redis.AgentResponse) {
+	log.Info("BOT:handleAgentResponse", "callid", callid, "type", resp.Type, "text", resp.Text, "file", resp.File)
+	
+	switch resp.Type {
+	case "text":
+		// 文字转语音
+		if resp.Text == "" {
+			log.Error("BOT:handleAgentResponse", "callid", callid, "error", "Empty text in agent response")
+			return
+		}
+		
+		// 1. 翻译文字(中文→英文)
+		translatedText := v.translateProvider.TranslateTextSync(resp.Text, resp.SourceLanguage, resp.TargetLanguage)
+		log.Info("BOT:handleAgentResponse", "callid", callid, "original", resp.Text, "translated", translatedText)
+		
+		// 2. TTS输出
+		useGoogle := os.Getenv("USE_GOOGLE_STT_TTS") == "true"
+		if useGoogle {
+			if v.googleTTSProvider != nil {
+				v.googleTTSProvider.AddText(callid, translatedText, "agent-text", resp.TargetLanguage)
+			} else {
+				log.Error("BOT:handleAgentResponse", "callid", callid, "error", "Google TTS provider not available")
+			}
+		} else {
+			if v.ttsprovider != nil {
+				v.ttsprovider.AddText(callid, translatedText, "agent-text", resp.TargetLanguage)
+			} else {
+				log.Error("BOT:handleAgentResponse", "callid", callid, "error", "TTS provider not available")
+			}
+		}
+		
+	case "sound":
+		// 播放音频文件
+		if resp.File == "" {
+			log.Error("BOT:handleAgentResponse", "callid", callid, "error", "Empty file path in agent response")
+			return
+		}
+		
+		log.Info("BOT:handleAgentResponse", "callid", callid, "status", "PlayingFile", "file", resp.File)
+		v.PlayFile(callid, resp.File, "")
+		
+	default:
+		log.Error("BOT:handleAgentResponse", "callid", callid, "error", "Unknown response type", "type", resp.Type)
+	}
 }

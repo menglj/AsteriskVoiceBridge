@@ -150,12 +150,59 @@ func (g *GoogleTranslateProvider) GetTargetLanguage() string {
 	return g.targetLanguage
 }
 
-// Close closes the Google Translate client
-func (g *GoogleTranslateProvider) Close() error {
-	if g.client != nil {
-		return g.client.Close()
+// TranslateTextSync 同步翻译(用于坐席文字回应)
+func (g *GoogleTranslateProvider) TranslateTextSync(text, sourceLang, targetLang string) string {
+	if text == "" {
+		return ""
 	}
-	return nil
+
+	// Clean up the text
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+
+	log.Info("Sync translating text", 
+		"text", text, 
+		"source", sourceLang, 
+		"target", targetLang)
+
+	ctx := context.Background()
+
+	// Convert language codes to language.Tag
+	sourceTag, err := language.Parse(sourceLang)
+	if err != nil {
+		log.Error("Invalid source language", "language", sourceLang, "error", err)
+		return text
+	}
+
+	targetTag, err := language.Parse(targetLang)
+	if err != nil {
+		log.Error("Invalid target language", "language", targetLang, "error", err)
+		return text
+	}
+
+	// Perform translation
+	translations, err := g.client.Translate(ctx, []string{text}, targetTag, &translate.Options{
+		Source: sourceTag,
+		Format: translate.Text,
+	})
+	if err != nil {
+		log.Error("Sync translation failed", "error", err)
+		return text
+	}
+
+	if len(translations) == 0 {
+		log.Error("No sync translation result")
+		return text
+	}
+
+	translatedText := translations[0].Text
+	log.Info("Sync translation completed", 
+		"original", text, 
+		"translated", translatedText)
+
+	return translatedText
 }
 
 // GetSupportedLanguages returns a list of supported language codes
