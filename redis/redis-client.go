@@ -43,6 +43,9 @@ type ClientMessage struct {
 	Action       string `json:"action"`
 	CallerNumber string `json:"caller_number"`
 	Timestamp    int64  `json:"timestamp"`
+	Context      string `json:"context"`
+	DidNumber    string `json:"did_number"`
+	Speaker      string `json:"speaker"`
 }
 
 // RedisClient handles Redis operations

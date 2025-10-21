@@ -837,7 +837,7 @@ func (c *Connector) Connect() bool {
 
 			dialkey := v.Channel.Dialplan.Exten + "@" + v.Channel.Dialplan.Context
 			log.Info("ARI:Connect", "DialKey", dialkey)
-			if dialkey == "8888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
+			if dialkey == "8888@from_router" || dialkey == "79838888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
 				log.Info("ARI:Connect", "DialKey", "Matched")
 				go handleNewCallWithArgs(c, c.ariClient.Channel().Get(v.Key(ari.ChannelKey, v.Channel.ID)), v.Args)
 			} else if chanIDSuffix == "call" {

@@ -1147,6 +1147,18 @@ func (v *VoiceBot) HandleTranslationResults(callid string, translatedText string
 			callerNumber = "unknown"
 		}
 
+		// extensions.conf context
+		astContext := call.info.Vars["CONTEXT"]
+		if astContext == "" {
+			astContext = "unknown"
+		}
+
+		// did number
+		didNumber := call.info.Vars["EXTEN"]
+		if didNumber == "" {
+			didNumber = "unknown"
+		}
+
 		clientMsg := redis.ClientMessage{
 			AgentNo:      agentExt,
 			CallID:       callid,
@@ -1155,6 +1167,9 @@ func (v *VoiceBot) HandleTranslationResults(callid string, translatedText string
 			Action:       "voicebot",
 			CallerNumber: callerNumber,
 			Timestamp:    time.Now().Unix(),
+			Context:      astContext, 
+			DidNumber:    didNumber,
+			Speaker:      "customer",
 		}
 
         queueKey := fmt.Sprintf("%s:E:AGENTS:L", call.info.Domain)
