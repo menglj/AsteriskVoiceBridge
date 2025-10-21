@@ -36,8 +36,13 @@ type AgentResponse struct {
 
 // ClientMessage represents a message from client to agent
 type ClientMessage struct {
+	AgentNo      string `json:"agentNo"`
+	CallID       string `json:"callid"`
 	OriginalText string `json:"original_text"`
 	Translation  string `json:"translation"`
+	Action       string `json:"action"`
+	CallerNumber string `json:"caller_number"`
+	Timestamp    int64  `json:"timestamp"`
 }
 
 // RedisClient handles Redis operations

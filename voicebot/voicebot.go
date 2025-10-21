@@ -1129,20 +1129,35 @@ func (v *VoiceBot) HandleTranslationResults(callid string, translatedText string
 
 	// Push client message to Redis before sending TTS
 	if v.redisClient != nil && call.lastTranscript != "" {
+		// 打印call.info的所有字段和值
+		log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "DebugCallInfo", "callInfo", call.info)
+		log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "DebugCallInfoVars", "vars", call.info.Vars)
+		
 		log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "AttemptingRedisPush", "lastTranscript", call.lastTranscript, "translatedText", translatedText)
-		
-		clientMsg := redis.ClientMessage{
-			OriginalText: call.lastTranscript,
-			Translation:  translatedText,
-		}
-		
+
         // Use agent extension for RECEIVE list as per spec
         agentExt := call.info.AgentExtension
         if agentExt == "" {
             agentExt = "1100"
         }
 
-        queueKey := fmt.Sprintf("%s:AI:AGENT:%s:RECEIVE:%s:L", call.info.Domain, agentExt, callid)
+		// 获取主叫号码
+		callerNumber := call.info.Vars["CALLERIDNUM"]
+		if callerNumber == "" {
+			callerNumber = "unknown"
+		}
+
+		clientMsg := redis.ClientMessage{
+			AgentNo:      agentExt,
+			CallID:       callid,
+			OriginalText: call.lastTranscript,
+			Translation:  translatedText,
+			Action:       "voicebot",
+			CallerNumber: callerNumber,
+			Timestamp:    time.Now().Unix(),
+		}
+
+        queueKey := fmt.Sprintf("%s:E:AGENTS:L", call.info.Domain)
         log.Info("BOT:HandleTranslationResults", "callid", callid, "status", "RedisPushDetails", "queueKey", queueKey, "agentExt", agentExt, "domain", call.info.Domain)
         
 		err := v.redisClient.PushClientMessage(queueKey, clientMsg)
