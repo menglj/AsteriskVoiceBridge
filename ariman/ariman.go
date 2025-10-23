@@ -561,8 +561,8 @@ func handleNewCallWithArgs(c *Connector, userChannel *ari.ChannelHandle, args []
 
 	// Create a snoop channel based on the user channel
 	snoopid := userChannel.ID() + "-snoop"
-    // Spy on caller's outgoing audio for STT, and whisper to caller for TTS playback
-    snoopopts := &ari.SnoopOptions{App: ariApp, Spy: "out", Whisper: "out"}
+    // Spy on caller's incoming audio for STT (客户听到的声音，包含客户说话)
+    snoopopts := &ari.SnoopOptions{App: ariApp, Spy: "in", Whisper: "out"}
 	snoopChannel, err := userChannel.Snoop(snoopid, snoopopts)
 	if err != nil {
 		log.Error("ARI:failed to snoop channel", "error", err)
@@ -837,7 +837,7 @@ func (c *Connector) Connect() bool {
 
 			dialkey := v.Channel.Dialplan.Exten + "@" + v.Channel.Dialplan.Context
 			log.Info("ARI:Connect", "DialKey", dialkey)
-			if dialkey == "8888@from_router" || dialkey == "79838888@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
+			if dialkey == "8888@from_router" || dialkey == "79831010@from_router" || dialkey == "613@voice-ai-service" || dialkey == "614@voice-ai-service" || dialkey == "615@voice-ai-service" || dialkey == "616@voice-ai-service" {
 				log.Info("ARI:Connect", "DialKey", "Matched")
 				go handleNewCallWithArgs(c, c.ariClient.Channel().Get(v.Key(ari.ChannelKey, v.Channel.ID)), v.Args)
 			} else if chanIDSuffix == "call" {
@@ -901,6 +901,8 @@ func (c *Connector) AddURItoCall(callid string, uri string) bool {
 	// Create the originate request based on the URI
 	var originate = ari.OriginateRequest{
 		Endpoint:  uri,
+		// Endpoint: "Local/1010@from_router/n",
+		// Endpoint: "Local/79831010@from-trunk/n",
 		App:       ariApp,
 		Timeout:   30,
 		ChannelID: call.internalChannel.ID() + "-call",
